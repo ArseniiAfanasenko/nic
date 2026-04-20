@@ -1,12 +1,16 @@
 #TODO: get header info from the compiler
 
 #all: TODO
+CFLAGS+=-std=c23 -Wall
 
 string_handling.o: string_handling.h string_handling.c
 	$(CC) $(CFLAGS) -c string_handling.c -o $@ $(LDFLAGS)
 
 hashmap.o: hashmap.h hashmap.c
 	$(CC) $(CFLAGS) -c hashmap.c -o $@ $(LDFLAGS)
+
+preprocessor: string_handling.h string_handling.o preprocessor.c
+	$(CC) $(CFLAGS) string_handling.o preprocessor.c -o $@ $(LDFLAGS)
 
 test_hashmap: hashmap.h hashmap.o string_handling.o test_hashmap.c
 	$(CC) $(CFLAGS) -o $@ string_handling.o hashmap.o test_hashmap.c $(LDFLAGS)

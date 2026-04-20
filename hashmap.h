@@ -15,6 +15,7 @@ typedef struct {
   size_t capacity;
 } HashMap;
 
+// TODO: can we tag key/value pointers with const?
 HashEntry *hashmap_get_or_insert_sv(HashMap *map, StringView key);
 void *hashmap_get(HashMap *map, const char *key);
 void *hashmap_get_sv(HashMap *map, StringView key);
