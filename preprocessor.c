@@ -1,11 +1,93 @@
 #include <assert.h>
 #include <ctype.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "common.h"
-#include "string_handling.h"
+// TODO: this is one giant file for now because porting it to nilang that way will be way easier later.
+
+#define MAX(x, y) ((x) < (y) ? (y) : (x))
+#define MIN(x, y) ((x) < (y) ? (x) : (y))
+
+typedef struct {
+  const char* data;
+  size_t count;
+} StringView;
+
+// TODO: actually arenas and not malloc
+typedef struct {
+  union {
+    StringView sv;
+    struct {
+      char* data;
+      size_t count;
+    };
+  };
+  size_t capacity;
+} StringArena;
+
+// TODO: in nilang, we would use a range_usize instead and not hold pointer to the arena.
+// Since an Arena is stored on the stack, the holder knows already where to look to.
+// If it was deallocated from the stack, then the pointer would be invalid anyway.
+typedef struct {
+  const StringArena* arena;
+  size_t start;
+  size_t count;
+} StringArenaRef;
+
+StringView sv_from_cstr(const char* const cstr) {
+  return (StringView){cstr, strlen(cstr)};
+}
+bool sv_equal(const StringView sv1, const StringView sv2) {
+  if (sv1.count != sv2.count) return false;
+  return !strncmp(sv1.data, sv2.data, sv1.count);
+}
+
+StringView sv_slice(const StringView src, const size_t i1, const size_t i2) {
+  return (StringView){src.data + i1, i2 - i1};
+}
+
+StringArenaRef make_string_arena_ref(const StringArena* const arena, const size_t count) {
+  return (StringArenaRef){arena, arena->count - count, count};
+}
+
+StringView string_arena_ref_to_sv(const StringArenaRef* const ref) {
+  return sv_slice(ref->arena->sv, ref->start, ref->start + ref->count);
+}
+
+// TODO: actually arena and not malloc
+char* string_arena_alloc(StringArena* const target, const size_t count) {
+  size_t new_count = target->count + count;
+  if (new_count >= target->capacity) {
+    size_t new_capacity = MAX(target->capacity * 2, new_count);
+    target->data = realloc(target->data, new_capacity * sizeof(target->data[0]));
+    target->capacity = new_capacity;
+  };
+  target->count = new_count;
+  return target->data + target->count - count;
+}
+
+size_t string_arena_append_sv(StringArena* const target, const StringView elem) {
+  string_arena_alloc(target, elem.count);
+  memcpy(target->data + target->count - elem.count, elem.data, elem.count);
+  return elem.count;
+}
+
+size_t string_arena_printf(StringArena* const target, const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  // + 1 is for null terminate vsnprintf always writes
+  size_t count = vsnprintf(NULL, 0, fmt, ap) + 1;
+  va_end(ap);
+
+  va_start(ap, fmt);
+  vsnprintf(string_arena_alloc(target, count), count, fmt, ap);
+  va_end(ap);
+  return count;
+}
 
 typedef struct {
   size_t tab_size;
@@ -561,6 +643,7 @@ CTokenDA preprocess_and_tokenize(const TokenizerConfig* const config,
   CTokenizerState state = {.buffer = buffer};
 
   CToken next = {0};
+  // TODO: redo this via simd.
   do {
     // Invariant: there is always at least one symbol under the cursor.
     // If you need more, check the length.
@@ -578,12 +661,15 @@ CTokenDA preprocess_and_tokenize(const TokenizerConfig* const config,
       // TODO: noop for now
       evaluate_preprocessor_directive(&state);
       continue;
+    // TODO: whether or not to keep comments should be part of global config
     } else if (try_consuming_singleline_comment(comment_arena, &state)) {
       continue;
     } else if (try_consuming_multiline_comment(comment_arena, &state)) {
       continue;
+    // TODO: whether or not to keep newlines should be part of global config
     } else if (try_consuming_newline(&state)) {
       continue;
+    // TODO: keeping whitespace makes no sense
     } else if (try_consuming_whitespace(config, &state)) {
       continue;
     } else if (try_consuming_punct(&state)) {
