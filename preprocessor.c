@@ -29,11 +29,11 @@ typedef struct {
   size_t capacity;
 } StringArena;
 
-// TODO: in nilang, we would use a range_usize instead and not hold pointer to the arena.
+// TODO: in nilang, we would use a range_u32, since it's extremely unlikely you actually need to index more than 4gb.
+// TODO: small string optimization. Requires endianness.
 // Since an Arena is stored on the stack, the holder knows already where to look to.
 // If it was deallocated from the stack, then the pointer would be invalid anyway.
 typedef struct {
-  const StringArena* arena;
   size_t start;
   size_t count;
 } StringArenaRef;
@@ -51,11 +51,11 @@ StringView sv_slice(const StringView src, const size_t i1, const size_t i2) {
 }
 
 StringArenaRef make_string_arena_ref(const StringArena* const arena, const size_t count) {
-  return (StringArenaRef){arena, arena->count - count, count};
+  return (StringArenaRef){arena->count - count, count};
 }
 
-StringView string_arena_ref_to_sv(const StringArenaRef* const ref) {
-  return sv_slice(ref->arena->sv, ref->start, ref->start + ref->count);
+StringView string_arena_ref_to_sv(const StringArena* const arena, const StringArenaRef* const ref) {
+  return sv_slice(arena->sv, ref->start, ref->start + ref->count);
 }
 
 // TODO: actually arena and not malloc
@@ -690,7 +690,10 @@ CTokenDA preprocess_and_tokenize(const TokenizerConfig* const config,
   return state.result;
 }
 
-static StringView c_token_to_debug_sv(StringArena* const a, const CToken* const token) {
+static StringView c_token_to_debug_sv(StringArena* const a,
+		                      const StringArena* const comment_arena,
+		                      const StringArena* const identifier_arena,
+				      const CToken* const token) {
   StringView res = {0};
   switch (token->kind) {
     case C_TK_newline:
@@ -698,15 +701,13 @@ static StringView c_token_to_debug_sv(StringArena* const a, const CToken* const 
       break;
     case C_TK_multiline_comment:
       res.count += string_arena_append_sv(a, sv_from_cstr("multiline_comment - "));
-      if (token->comment.arena != NULL) {
-        res.count += string_arena_append_sv(a, string_arena_ref_to_sv(&token->comment));
-      }
+      // TODO: account for config
+      res.count += string_arena_append_sv(a, string_arena_ref_to_sv(comment_arena, &token->comment));
       break;
     case C_TK_singleline_comment:
       res.count += string_arena_append_sv(a, sv_from_cstr("singleline_comment - "));
-      if (token->comment.arena != NULL) {
-        res.count += string_arena_append_sv(a, string_arena_ref_to_sv(&token->comment));
-      }
+      // TODO: account for config
+      res.count += string_arena_append_sv(a, string_arena_ref_to_sv(comment_arena, &token->comment));
       break;
     case C_TK_whitespace:
       res.count += string_arena_printf(a, "whitespace - %ld", token->whitespace);
@@ -774,7 +775,8 @@ static StringView c_token_to_debug_sv(StringArena* const a, const CToken* const 
       break;
     case C_TK_identifier:
       res.count += string_arena_append_sv(a, sv_from_cstr("identifier - "));
-      res.count += string_arena_append_sv(a, string_arena_ref_to_sv(&token->identifier));
+      // TODO: account for config
+      res.count += string_arena_append_sv(a, string_arena_ref_to_sv(comment_arena, &token->identifier));
       break;
     case C_TK_eof:
       res.count += string_arena_append_sv(a, sv_from_cstr("eof"));
@@ -823,7 +825,7 @@ int main(void) {
 					 &identifier_arena,
 					 sv_from_cstr(TESTTEXT));
   for (size_t i = 0; i < res.count; ++i) {
-    StringView elem_debug_sv = c_token_to_debug_sv(&debug_dump_arena, &res.data[i]);
+    StringView elem_debug_sv = c_token_to_debug_sv(&debug_dump_arena, &comment_arena, &identifier_arena, &res.data[i]);
     fprintf(stderr, "%.*s\n", (int)elem_debug_sv.count, elem_debug_sv.data);
   }
   return 0;
