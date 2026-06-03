@@ -1,4 +1,7 @@
 **/*.o
 /test_hashmap
 /preprocessor
+/*.out
+/string_to_int
+.*.swp
 

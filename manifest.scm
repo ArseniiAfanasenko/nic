@@ -1,19 +1,18 @@
 (use-modules (guix profiles)
              (guix packages)
              (guix search-paths)
-             (gnu packages commencement)
              (gnu packages musl))
 
-;; Create a custom GCC package that exports CC and LD_LIBRARY_PATH
-(define gcc-with-env-cc
+;; Create a custom musl package that exports CC and LD_LIBRARY_PATH
+(define musl-with-env-cc
   (package
-    (inherit gcc-toolchain)
-    (name "gcc-toolchain")
+    (inherit musl)
+    (name "musl-with-env-cc")
     (native-search-paths
-     (append (package-native-search-paths gcc-toolchain)
+     (append (package-native-search-paths musl)
              (list (search-path-specification
                     (variable "CC")
-                    (files '("bin/gcc"))
+                    (files '("bin/musl-gcc"))
                     (file-type 'regular)
                     (separator #f))
                    (search-path-specification
@@ -22,4 +21,4 @@
                     (file-type 'directory)
                     (separator ":")))))))
 
-(packages->manifest (list gcc-with-env-cc glibc))
+(packages->manifest (list musl-with-env-cc))

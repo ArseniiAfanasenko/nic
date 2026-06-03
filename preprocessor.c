@@ -1,35 +1,128 @@
 #include <assert.h>
 #include <ctype.h>
+#include <errno.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 
 // TODO: this is one giant file for now because porting it to nilang that way will be way easier later.
 
+// TODO: will be builtin operators in nilang
 #define MAX(x, y) ((x) < (y) ? (y) : (x))
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
+
+typedef char Byte;
+
+// TODO: should probably be global constant as part of nilib.
+typedef struct {
+  size_t memory_page_size_bytes;
+  // TODO: actually do this
+  // TODO: do we actually need it? with loop_stride and stuff?
+  size_t vector_register_size_bytes;
+} SystemInfo;
+
+SystemInfo system_info;
 
 typedef struct {
   const char* data;
   size_t count;
 } StringView;
 
-// TODO: actually arenas and not malloc
-typedef struct {
-  union {
-    StringView sv;
-    struct {
-      char* data;
-      size_t count;
-    };
-  };
-  size_t capacity;
-} StringArena;
+// TODO: in nilang, there would be more robust mechanism for generic types.
+// Here, the count and capacity are for amount of elements, not for bytes.
 
-// TODO: in nilang, we would use a range_u32, since it's extremely unlikely you actually need to index more than 4gb.
+// TODO: for regular arenas (e.g. not struct of arrays and co) it probably makes sense to just do one implementation.
+// TODO: return errors in allocations as values.
+// TODO: make type-generic arenas in nilang.
+// TODO: fix this writeup
+/*
+Note: There are two main ways to approach allocating contiguous (in virtual memory) buffer.
+You can either:
+- Do initial call to mmap, and then do mremap when need to expand.
+- Initially reserve a huge contiguous (in virtual memory) buffer via mmap, and
+then commit additional memory via mprotect when needed.
+The second approach is nicer because pointer stability.
+TODO: do we actually need pointer stability? If we use arena references instead of pointers?
+Note that both approaches require a syscall every time you expand, which is expensive time-wise.
+Ideal approach to memory allocation would be to actually use some heuristic to determine the size of needed memory
+on first allocation, e.g. if you want to read file contents you can use "stat", and then never expand.
+Sometimes the heuristic is not obvious at first glance, for example if you are tokenizing a file you can't really
+easily tell how many tokens you will end up with from theory.
+In such cases, I recommend to first observe from practice what is the average amount you need from previous stage of
+the program using expanding arenas, add some percent in the formula for worst cases, and change this stage of program 
+to use static/non-expanding arena to reduce syscall count.
+This approach also allows to handle failure to allocate memory cleanly.
+*/
+// TODO: think of interface, what do we return??
+// Note: probably slice.
+
+// TODO: test this.
+// TODO: in nilang, with default parameters we can use default funtion names
+#define MAKE_TYPED_ARENA_DEFINITION(T, struct_name, init_function_name, alloc_function_name, append_function_name) \
+typedef struct {\
+  T* data;\
+  size_t count;\
+  size_t capacity;\
+  size_t reserve_count_bytes;\
+} struct_name;\
+\
+/* TODO: in nilang we would also return an error. */\
+struct_name (init_function_name)(size_t const reserve_count_bytes, size_t const capacity) {\
+  fprintf(stderr, "initial arena allocation\n");\
+  struct_name res = {0};\
+  /*This is a way to round value to nearest multiple of page size, using the fact that page size is multiple of 2.*/\
+  /*Ideally, we will have something like invariants and be able to optimize based on that.*/\
+  size_t rounded_reserve_count_bytes = (reserve_count_bytes + system_info.memory_page_size_bytes - 1) & ~(system_info.memory_page_size_bytes - 1);\
+  fprintf(stderr, "rounded_reserve_count_bytes: %ld\n", rounded_reserve_count_bytes);\
+  res.reserve_count_bytes = rounded_reserve_count_bytes;\
+  /* Note: it is important that result of mmap is page-aligned and zeroed. */\
+  Byte* virtual_alloc_ptr = mmap(NULL, rounded_reserve_count_bytes, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);\
+  size_t initial_capacity_bytes = (capacity * sizeof(T) + system_info.memory_page_size_bytes - 1) & ~(system_info.memory_page_size_bytes - 1);\
+  fprintf(stderr, "initial_capacity_bytes: %ld\n", initial_capacity_bytes);\
+  /* Size value of mprotect needs to be a multiple of page size. */\
+  mprotect(virtual_alloc_ptr, initial_capacity_bytes, PROT_READ | PROT_WRITE);\
+  res.data = (T*)virtual_alloc_ptr;\
+  fprintf(stderr, "initial_capacity: %ld\n", initial_capacity_bytes / sizeof(T));\
+  res.capacity = initial_capacity_bytes / sizeof(T);\
+  res.count = 0;\
+  return res;\
+};\
+\
+/* TODO: separate alloc and append_count */\
+T* (alloc_function_name)(struct_name* const target, size_t const count) {\
+  size_t new_count = target->count + count;\
+  if (new_count >= target->capacity) /* TODO: unlikely */ {\
+    fprintf(stderr, "arena expansion\n");\
+    /* TODO: expanding by factor of 2 is matematically suboptimal. */\
+    size_t new_capacity_bytes = MAX((target->capacity * sizeof(T)) * 2, new_count * sizeof(T));\
+    new_capacity_bytes = (new_capacity_bytes + system_info.memory_page_size_bytes - 1) & ~(system_info.memory_page_size_bytes - 1);\
+    fprintf(stderr, "new_capacity_bytes: %ld\n", new_capacity_bytes);\
+    /* TODO: check if new_capacity_bytes is more than reserve, return OUT OF MEMORY error. */\
+    mprotect((char*)target->data, new_capacity_bytes, PROT_READ | PROT_WRITE);\
+    target->capacity = new_capacity_bytes / sizeof(T);\
+    fprintf(stderr, "new_capacity: %ld\n", target->capacity);\
+  };\
+  target->count = new_count;\
+  return target->data + target->count - count;\
+};\
+\
+/* TODO: error if alloc failed*/\
+void (append_function_name)(struct_name* const target, const T* elem) {\
+  *(alloc_function_name(target, 1)) = *elem;\
+};
+
+#define typed_arena_last(target) (target).data[(target).count - 1]
+
+MAKE_TYPED_ARENA_DEFINITION(char, StringArena, string_arena_init, string_arena_alloc, string_arena_append)
+
 // TODO: small string optimization. Requires endianness.
 // Since an Arena is stored on the stack, the holder knows already where to look to.
 // If it was deallocated from the stack, then the pointer would be invalid anyway.
@@ -41,6 +134,7 @@ typedef struct {
 StringView sv_from_cstr(const char* const cstr) {
   return (StringView){cstr, strlen(cstr)};
 }
+
 bool sv_equal(const StringView sv1, const StringView sv2) {
   if (sv1.count != sv2.count) return false;
   return !strncmp(sv1.data, sv2.data, sv1.count);
@@ -55,25 +149,276 @@ StringArenaRef make_string_arena_ref(const StringArena* const arena, const size_
 }
 
 StringView string_arena_ref_to_sv(const StringArena* const arena, const StringArenaRef* const ref) {
-  return sv_slice(arena->sv, ref->start, ref->start + ref->count);
-}
-
-// TODO: actually arena and not malloc
-char* string_arena_alloc(StringArena* const target, const size_t count) {
-  size_t new_count = target->count + count;
-  if (new_count >= target->capacity) {
-    size_t new_capacity = MAX(target->capacity * 2, new_count);
-    target->data = realloc(target->data, new_capacity * sizeof(target->data[0]));
-    target->capacity = new_capacity;
-  };
-  target->count = new_count;
-  return target->data + target->count - count;
+  return sv_slice(*(const StringView*)arena, ref->start, ref->start + ref->count);
 }
 
 size_t string_arena_append_sv(StringArena* const target, const StringView elem) {
   string_arena_alloc(target, elem.count);
   memcpy(target->data + target->count - elem.count, elem.data, elem.count);
   return elem.count;
+}
+
+typedef enum {
+  OpenOpStatus_success,
+  OpenOpStatus_component_of_path_does_not_exist,
+  OpenOpStatus_component_of_path_has_permissions_prohibiting_requested_access,
+  OpenOpStatus_component_of_path_is_not_a_directory,
+  _OpenOpStatus_unaccounted_error,
+  _OpenOpStatus_count,
+} OpenOperationStatus;
+
+// TODO: in nilang, we will have cross-platform "file handle" abstraction.
+typedef int LinuxFileDescriptor;
+
+typedef struct {
+  LinuxFileDescriptor fd;
+  OpenOperationStatus status;
+} _OpenOperationRes;
+
+// TODO: in nilang, we will have scratch arenas so path would be string view or something like that.
+// TODO: better mode enum
+// TODO: in nilang, we will have native multiple return values.
+_OpenOperationRes open_file(const char* path, int oflag) {
+  _OpenOperationRes res = {0};
+
+  int fd = open(path, oflag);
+  if (fd == -1) {
+    switch (errno) {
+      case EACCES:
+        res.status = OpenOpStatus_component_of_path_has_permissions_prohibiting_requested_access;
+	break;
+      case ENOENT:
+	res.status = OpenOpStatus_component_of_path_does_not_exist;
+	break;
+      case ENOTDIR:
+	res.status = OpenOpStatus_component_of_path_is_not_a_directory;
+	break;
+      default:
+	res.status = _OpenOpStatus_unaccounted_error;
+	break;
+    }
+    return res;
+  }
+  res = (_OpenOperationRes){fd, OpenOpStatus_success};
+  return res;
+}
+
+typedef struct stat LinuxStat;
+
+typedef enum {
+  StatOpStatus_success,
+  StatOpStatus_file_no_longer_exists,
+  StatOpStatus_low_level_io_error,
+  // TODO: internal filesystem limit
+  _StatOpStatus_unaccounted_error,
+  _StatOpStatus_count,
+} StatOperationStatus;
+
+typedef struct {
+  LinuxStat buf;
+  StatOperationStatus status;
+} _StatOperationRes;
+
+// TODO: implement
+_StatOperationRes stat_file_descriptor(LinuxFileDescriptor fd) {
+  _StatOperationRes res = {0};
+  if (fstat(fd, &res.buf) == -1) {
+    switch (errno) {
+      case EBADF:
+        res.status = StatOpStatus_file_no_longer_exists;
+	break;
+      case EIO:
+        res.status = StatOpStatus_low_level_io_error;
+	break;
+      default:
+	res.status = _StatOpStatus_unaccounted_error;
+	break;
+    }
+    return res;
+  }
+  res.status = StatOpStatus_success;
+  return res;
+}
+
+typedef enum {
+  IOOpStatus_success,
+  IOOpStatus_file_no_longer_exists,
+  IOOpStatus_expected_file_got_directory,
+  IOOpStatus_file_was_deleted_while_performing_io, // aka "somebody yanked the HDD out of the computer"
+  IOOpStatus_low_level_io_error,
+  _IOOpStatus_unaccounted_error,
+  _IOOpStatus_count,
+} IOOperationStatus;
+
+typedef enum {
+  ReadOpStatus_success                              = IOOpStatus_success,
+  ReadOpStatus_file_no_longer_exists                = IOOpStatus_file_no_longer_exists,
+  ReadOpStatus_expected_file_got_directory          = IOOpStatus_expected_file_got_directory,
+  ReadOpStatus_file_was_deleted_while_performing_io = IOOpStatus_file_was_deleted_while_performing_io,
+  ReadOpStatus_low_level_io_error                   = IOOpStatus_low_level_io_error,
+  _ReadOpStatus_unaccounted_error                   = _IOOpStatus_unaccounted_error,
+  // Stuff specific to read.
+  ReadOpStatus_not_enough_reserved_memory,
+  ReadOpStatus_memory_allocation_error,
+  ReadOpStatus_file_changed,
+  _ReadOpStatus_count,
+} ReadOperationStatus;
+
+// TODO: in nilang, it would take a byte arena, not string arena.
+// TODO: test this in all scenarios.
+ReadOperationStatus read_entire_file_descriptor_into_string_arena(LinuxFileDescriptor fd, StringArena* const target) {
+  ReadOperationStatus res = 0;
+  // TODO: in nilang, we will have "defer"
+
+  auto stat_res = stat_file_descriptor(fd);
+  if (stat_res.status != StatOpStatus_success) {
+    switch (stat_res.status) {
+      case StatOpStatus_file_no_longer_exists:
+        res = ReadOpStatus_file_no_longer_exists;
+	break;
+      case StatOpStatus_low_level_io_error:
+        res = ReadOpStatus_low_level_io_error;
+	break;
+      default:
+	res = _ReadOpStatus_unaccounted_error;
+	break;
+    }
+    return res;
+  }
+
+  if (S_ISDIR(stat_res.buf.st_mode)) {
+    res = ReadOpStatus_expected_file_got_directory;
+    return res;
+  }
+
+  if (target->reserve_count_bytes - target->count * sizeof(char) < (size_t)stat_res.buf.st_size) {
+    res = ReadOpStatus_not_enough_reserved_memory;
+    return res;
+  }
+
+  // TODO: check
+  string_arena_alloc(target, stat_res.buf.st_size);
+  // TODO: fix when changing arena API
+  target->count -= (size_t)stat_res.buf.st_size;
+
+  size_t total_read_bytes_count = 0;
+  for (ssize_t read_bytes_count = 0; total_read_bytes_count < (size_t)stat_res.buf.st_size;) {
+    read_bytes_count = read(fd, &target->data[target->count + total_read_bytes_count], (size_t)stat_res.buf.st_size - total_read_bytes_count);
+
+    if (read_bytes_count < 0) {
+      switch (errno) {
+        case EINTR: // Interrupted by signal. Trying again.
+          continue;
+	case EBADF:
+	  res = ReadOpStatus_file_was_deleted_while_performing_io;
+	  break;
+	case EIO:
+	  res = ReadOpStatus_low_level_io_error;
+	  break;
+	default:
+	  res = _ReadOpStatus_unaccounted_error;
+	  break;
+      }
+      return res;
+    }
+
+    if (read_bytes_count == 0) /* EOF */ {
+      break;
+    }
+
+    total_read_bytes_count += (size_t)read_bytes_count;
+  }
+
+  target->count += total_read_bytes_count;
+
+  // TODO: check if original stat matches current one, also say that file changed
+  if (total_read_bytes_count != (size_t)stat_res.buf.st_size) {
+    res = ReadOpStatus_file_changed;
+    return res;
+  }
+
+  res = ReadOpStatus_success;
+  return res;
+}
+
+typedef enum {
+  WriteOpStatus_success                              = IOOpStatus_success,
+  WriteOpStatus_file_no_longer_exists                = IOOpStatus_file_no_longer_exists,
+  WriteOpStatus_expected_file_got_directory          = IOOpStatus_expected_file_got_directory,
+  WriteOpStatus_file_was_deleted_while_performing_io = IOOpStatus_file_was_deleted_while_performing_io,
+  WriteOpStatus_low_level_io_error                   = IOOpStatus_low_level_io_error,
+  _WriteOpStatus_unaccounted_error                   = _IOOpStatus_unaccounted_error,
+  // Stuff specific to write.
+  WriteOpStatus_trying_to_write_too_much,
+  WriteOpStatus_no_space_remaining_on_the_device,
+  // TODO: handle more errno values.
+  _WriteOpStatus_count,
+} WriteOperationStatus;
+
+// TODO: in nilang, it would take a sized array of Byte readonly, not StringView.
+// TODO: test this in all scenarios.
+WriteOperationStatus write_entire_file_descriptor(LinuxFileDescriptor fd, StringView buffer) {
+  WriteOperationStatus res = 0;
+
+  auto stat_res = stat_file_descriptor(fd);
+  if (stat_res.status != StatOpStatus_success) {
+    switch (stat_res.status) {
+      case StatOpStatus_file_no_longer_exists:
+        res = WriteOpStatus_file_no_longer_exists;
+	break;
+      case StatOpStatus_low_level_io_error:
+        res = WriteOpStatus_low_level_io_error;
+	break;
+      default:
+	res = _WriteOpStatus_unaccounted_error;
+	break;
+    }
+    return res;
+  }
+  fprintf(stderr, "At least could stat.\n");
+
+  if (S_ISDIR(stat_res.buf.st_mode)) {
+    res = WriteOpStatus_expected_file_got_directory;
+    return res;
+  }
+
+  fprintf(stderr, "At least regular file.\n");
+
+  size_t total_written_bytes_count = 0;
+  for (ssize_t written_bytes_count = 0; total_written_bytes_count < buffer.count;) {
+    written_bytes_count = write(fd, &buffer.data[total_written_bytes_count], buffer.count - total_written_bytes_count);
+    fprintf(stderr, "Written bytes count: %ld.\n", written_bytes_count);
+
+    if (written_bytes_count < 0) {
+      // TODO: handle everything
+      switch (errno) {
+        case EINTR: // Interrupted by signal. Trying again.
+          continue;
+	case EBADF:
+	  res = WriteOpStatus_file_was_deleted_while_performing_io;
+	  break;
+	case EIO:
+	  res = WriteOpStatus_low_level_io_error;
+	  break;
+	default:
+	  res = _WriteOpStatus_unaccounted_error;
+	  break;
+      }
+      return res;
+    }
+
+    // TODO: what is the case here?
+    #if 0
+    if (read_bytes_count == 0) /* EOF */ {
+      break;
+    }
+    #endif
+
+    total_written_bytes_count += (size_t)written_bytes_count;
+  }
+
+  res = WriteOpStatus_success;
+  return res;
 }
 
 size_t string_arena_printf(StringArena* const target, const char *fmt, ...) {
@@ -89,384 +434,291 @@ size_t string_arena_printf(StringArena* const target, const char *fmt, ...) {
   return count;
 }
 
-typedef struct {
-  size_t tab_size;
-} TokenizerConfig;
-
-const TokenizerConfig default_tokenizer_config = (TokenizerConfig){.tab_size = 2};
-
-// https://en.cppreference.com/c/keyword
 typedef enum {
-  C_KW_void,
-  C_KW_bool,
-  C_KW_signed,
-  C_KW_unsigned,
-  C_KW_char,
-  C_KW_short,
-  C_KW_int,
-  C_KW_long,
-  C_KW_float,
-  C_KW_double,
-  C_KW_BitInt,
-  C_KW_Complex,
-  C_KW_Imaginary,
-  C_KW_Decimal32,
-  C_KW_Decimal64,
-  C_KW_Decimal128,
+  _NI_TK_zero_stub,
+  // TODO: just bool, Bool8 looks stupid.
+  NI_TK_Bool8,
+  _NI_TK_stringifiable_start = NI_TK_Bool8,
+  // TODO: reorder stuff here so that when we do perfect hashing we don't need a lookup table.
+  /* TYPES: */
+  NI_TK_Byte,
+  // Distinct integers, neither arithmetic nor bit operations are allowed on them.
+  // Useful for e.g. linux file descriptors.
+  NI_TK_D8,
+  NI_TK_D16,
+  NI_TK_D32,
+  NI_TK_D64,
+  // Bit integers, arithmetic is not allowed on them, only bitwise operations and shifts.
+  NI_TK_B8,
+  NI_TK_B16,
+  NI_TK_B32,
+  NI_TK_B64,
+  // TODO: Do we do 128 bit types?
+  // NI_TK_B128,
+  // Unsigned integers.
+  NI_TK_U8,
+  NI_TK_U16,
+  NI_TK_U32,
+  NI_TK_U64,
+  // NI_TK_U128,
+  NI_TK_USize,
+  // Signed integers.
+  NI_TK_S8,
+  NI_TK_S16,
+  NI_TK_S32,
+  NI_TK_S64,
+  // NI_TK_S128,
+  NI_TK_SSize,
+  // Floating point numbers.
+  NI_TK_F32,
+  NI_TK_F64,
+  // TODO: F80? Does anybody actually use it in current day and age?
 
-  C_KW_false,
-  C_KW_true,
-  C_KW_nullptr,
+  // TODO: automatically suggest adding NoReturn in tidy phase.
+  NI_TK_NoReturn,
 
-  C_KW_struct,
-  C_KW_union,
-  C_KW_enum,
-  C_KW_typedef,
+  NI_TK_false,
+  NI_TK_true,
+  NI_TK_null,
 
-  C_KW_auto,
-  C_KW_register,
-  C_KW_extern,
-  C_KW_thread_local,
-  C_KW_static,
-  C_KW_inline,
+  NI_TK_type,
+  NI_TK_subtype,
+  NI_TK_alias,
 
-  C_KW_const,
-  C_KW_constexpr,
-  C_KW_volarile,
-  C_KW_restrict,
-  C_KW_alignas,
-  C_KW_Atomic,
+  NI_TK_struct,
+  NI_TK_union,
+  NI_TK_enum,
+  NI_TK_proc,
 
-  C_KW_sizeof,
-  C_KW_typeof,
-  C_KW_typeof_unqual,
-  C_KW_alignof,
+  NI_TK_global,
+  NI_TK_thread_local,
 
-  C_KW_return,
-  C_KW_if,
-  C_KW_else,
-  C_KW_for,
-  C_KW_do,
-  C_KW_while,
-  C_KW_continue,
-  C_KW_break,
-  C_KW_switch,
-  C_KW_case,
-  C_KW_default,
-  C_KW_goto,
+  NI_TK_readonly,
+  NI_TK_volatile,
+  NI_TK_exclusive,
 
-  C_KW_static_assert,
+  NI_TK_if,
+  NI_TK_else,
+  NI_TK_ifx,
+  // TODO: selectx?
+  NI_TK_select,
+  NI_TK_then,
+  NI_TK_loop,
+  NI_TK_loop_stride,
+  NI_TK_switch,
+  // TODO: do we really need it?
+  // NI_TK_switchx,
+  NI_TK_case,
+  NI_TK_fall,
+  NI_TK_continue,
+  NI_TK_break,
+  NI_TK_return,
 
-  // C11, deprecated in C23
-  C_KW_Noreturn,
+  /* OPERATORS: */
+  // Unary:
+  NI_TK_bitwise_negate,         // aka "~"
+  NI_TK_bool_negate,            // aka "!"
+  // Either unary or binary depending on the context:
+  NI_TK_minus,
+  NI_TK_ampersand,              // aka "&"
+  // Binary:
+  // - Comparison:
+  NI_TK_equal,                  // aka "=="
+  NI_TK_not_equal,              // aka "!="
+  NI_TK_less,                   // aka "<"
+  NI_TK_less_equal,             // aka "<="
+  NI_TK_greater,                // aka ">"
+  NI_TK_greater_equal,          // aka ">="
+  // - Logical:
+  NI_TK_logic_or,               // aka "||"
+  NI_TK_logic_and,              // aka "&&"
+  // - Bit manipulation:
+  // TODO: arithmetic and logical shifts?
+  NI_TK_shift_left,             // aka "<<"
+  NI_TK_shift_right,            // aka ">>"
+  NI_TK_most_significant_bit,   // aka ">|"
+  NI_TK_count_trailing_zeros,   // aka "|<"
+  NI_TK_bitwise_xor,            // aka "^"
+  NI_TK_bitwise_or,             // aka "|"
+  // - Arithmetic:
+  NI_TK_add,                    // aka "*"
+  NI_TK_saturated_add,          // aka "++"
+  NI_TK_saturated_sub,          // aka "--"
+  NI_TK_mult,                   // aka "*"
+  NI_TK_saturated_mult,         // aka "**"
+  NI_TK_div,                    // aka "/"
+  NI_TK_pymod,                  // aka "%"
+  // TODO: kinda conflicts with saturated arithmetic, redo
+  NI_TK_cmod,                   // aka "%%"
+  // Binary, terminating (assignment):
+  // - Assign/bitwise copy:
+  NI_TK_assign,                 // aka "="
+  // - Bit manipulation:
+  // TODO: arithmetic and logical shifts
+  NI_TK_shift_left_assign,      // aka "<<="
+  NI_TK_shift_right_assign,     // aka ">>="
+  NI_TK_bitwise_xor_assign,     // aka "^="
+  NI_TK_bitwise_or_assign,      // aka "|="
+  NI_TK_bitwise_and_assign,     // aka "&="
+  // - Arithmetic:
+  NI_TK_add_assign,             // aka "+="
+  NI_TK_saturated_add_assign,   // aka "++="
+  NI_TK_sub_assign,             // aka "-="
+  NI_TK_saturated_sub_assign,   // aka "--="
+  NI_TK_mult_assign,            // aka "*="
+  NI_TK_saturated_mult_assign,  // aka "**="
+  NI_TK_div_assign,             // aka "/="
+  NI_TK_pymod_assign,           // aka "%="
+  // TODO: redo
+  NI_TK_cmod_assign,            // aka "%%="
+  /* PUNCTUATORS: */
+  NI_TK_dot,                    // aka ".", either constant, cast, or aggregate type member access.
+  NI_TK_comma,                  // aka ","
+  NI_TK_semicolon,              // aka ";"
+  NI_TK_colon,                  // aka ":"
+  NI_TK_open_rounded,           // aka "("
+  NI_TK_close_rounded,          // aka ")"
+  NI_TK_open_curly,             // aka "{"
+  NI_TK_close_curly,            // aka "}"
+  NI_TK_open_bracket,           // aka "["
+  NI_TK_close_bracket,          // aka "]"
+  _NI_TK_stringifiable_end = NI_TK_close_bracket,
 
-  C_KW_Generic,
-  _C_KW_count,
-} CKeyword;
+  /* Things which don't have static string representation */
+  NI_TK_base2_literal,
+  NI_TK_base8_literal,
+  NI_TK_base10_literal,
+  NI_TK_base16_literal,
+  NI_TK_identifier,
+  _NI_TK_count,
+} NiTokenKind;
 
-static const char* c_keyword_cstr[_C_KW_count] = {
-  [C_KW_void] = "void",
-  [C_KW_bool] = "bool",
-  [C_KW_signed] = "signed",
-  [C_KW_unsigned] = "unsigned",
-  [C_KW_char] = "char",
-  [C_KW_short] = "short",
-  [C_KW_int] = "int",
-  [C_KW_long] = "long",
-  [C_KW_float] = "float",
-  [C_KW_double] = "double",
-  [C_KW_BitInt] = "_BitInt",
-  [C_KW_Complex] = "_Complex",
-  [C_KW_Imaginary] = "_Imaginary",
-  [C_KW_Decimal32] = "_Decimal32",
-  [C_KW_Decimal64] = "_Decimal64",
-  [C_KW_Decimal128] = "_Decimal128",
-
-  [C_KW_false] = "false",
-  [C_KW_true] = "true",
-  [C_KW_nullptr] = "nullptr",
-
-  [C_KW_struct] = "struct",
-  [C_KW_union] = "union",
-  [C_KW_enum] = "enum",
-  [C_KW_typedef] = "typedef",
-
-  [C_KW_auto] = "auto",
-  [C_KW_register] = "register",
-  [C_KW_extern] = "extern",
-  [C_KW_thread_local] = "thread_local",
-  [C_KW_static] = "static",
-  [C_KW_inline] = "inline",
-
-  [C_KW_const] = "const",
-  [C_KW_constexpr] = "constexpr",
-  [C_KW_volarile] = "volarile",
-  [C_KW_restrict] = "restrict",
-  [C_KW_alignas] = "alignas",
-  [C_KW_Atomic] = "_Atomic",
-
-  [C_KW_sizeof] = "sizeof",
-  [C_KW_typeof] = "typeof",
-  [C_KW_typeof_unqual] = "typeof_unqual",
-  [C_KW_alignof] = "alignof",
-
-  [C_KW_return] = "return",
-  [C_KW_if] = "if",
-  [C_KW_else] = "else",
-  [C_KW_for] = "for",
-  [C_KW_do] = "do",
-  [C_KW_while] = "while",
-  [C_KW_continue] = "continue",
-  [C_KW_break] = "break",
-  [C_KW_switch] = "switch",
-  [C_KW_case] = "case",
-  [C_KW_default] = "default",
-  [C_KW_goto] = "goto",
-
-  [C_KW_static_assert] = "static_assert",
-
-  // C11, deprecated in C23
-  [C_KW_Noreturn] = "_Noreturn",
-
-  [C_KW_Generic] = "_Generic",
+// TODO: something like @exhaustive
+// TODO: something like @don't this do identifier
+// TODO: align
+static const char* ni_token_cstr[_NI_TK_count] = {
+  [NI_TK_Bool8] = "Bool8",
+  [NI_TK_Byte] = "Byte",
+  [NI_TK_D8] = "D8",
+  [NI_TK_D16] = "D16",
+  [NI_TK_D32] = "D32",
+  [NI_TK_D64] = "D64",
+  [NI_TK_B8] = "B8",
+  [NI_TK_B16] = "B16",
+  [NI_TK_B32] = "B32",
+  [NI_TK_B64] = "B64",
+  [NI_TK_U8] = "U8",
+  [NI_TK_U16] = "U16",
+  [NI_TK_U32] = "U32",
+  [NI_TK_U64] = "U64",
+  [NI_TK_USize] = "USize",
+  [NI_TK_S8] = "S8",
+  [NI_TK_S16] = "S16",
+  [NI_TK_S32] = "S32",
+  [NI_TK_S64] = "S64",
+  [NI_TK_SSize] = "SSize",
+  [NI_TK_F32] = "F32",
+  [NI_TK_F64] = "F64",
+  [NI_TK_NoReturn] = "NoReturn",
+  [NI_TK_false] = "false",
+  [NI_TK_true] = "true",
+  [NI_TK_null] = "null",
+  [NI_TK_type] = "type",
+  [NI_TK_subtype] = "subtype",
+  [NI_TK_alias] = "alias",
+  [NI_TK_struct] = "struct",
+  [NI_TK_union] = "union",
+  [NI_TK_enum] = "enum",
+  [NI_TK_proc] = "proc",
+  [NI_TK_global] = "global",
+  [NI_TK_thread_local] = "thread_local",
+  [NI_TK_readonly] = "readonly",
+  [NI_TK_volatile] = "volatile",
+  [NI_TK_exclusive] = "exclusive",
+  [NI_TK_if] = "if",
+  [NI_TK_else] = "else",
+  [NI_TK_ifx] = "ifx",
+  [NI_TK_select] = "select",
+  [NI_TK_then] = "then",
+  [NI_TK_loop] = "loop",
+  [NI_TK_loop_stride] = "loop_stride",
+  [NI_TK_switch] = "switch",
+  [NI_TK_case] = "case",
+  [NI_TK_fall] = "fall",
+  [NI_TK_continue] = "continue",
+  [NI_TK_break] = "break",
+  [NI_TK_return] = "return",
+  [NI_TK_bitwise_negate] = "~",
+  [NI_TK_bool_negate] = "!",
+  [NI_TK_add] = "+",
+  [NI_TK_minus] = "-",
+  [NI_TK_ampersand] = "&",
+  [NI_TK_equal] = "==",
+  [NI_TK_not_equal] = "!=",
+  [NI_TK_less] = "<",
+  [NI_TK_less_equal] = "<=",
+  [NI_TK_greater] = ">",
+  [NI_TK_greater_equal] = ">=",
+  [NI_TK_logic_or] = "||",
+  [NI_TK_logic_and] = "&&",
+  [NI_TK_shift_left] = "<<",
+  [NI_TK_shift_right] = ">>",
+  [NI_TK_most_significant_bit] = ">|",
+  [NI_TK_count_trailing_zeros] = "|<",
+  [NI_TK_bitwise_xor] = "^",
+  [NI_TK_bitwise_or] = "|",
+  [NI_TK_saturated_add] = "++",
+  [NI_TK_saturated_sub] = "--",
+  [NI_TK_mult] = "*",
+  [NI_TK_saturated_mult] = "**",
+  [NI_TK_div] = "/",
+  [NI_TK_pymod] = "%",
+  // TODO: redo
+  [NI_TK_cmod] = "%%",
+  [NI_TK_assign] = "=",
+  [NI_TK_shift_left_assign] = "<<=",
+  [NI_TK_shift_right_assign] = ">>=",
+  [NI_TK_bitwise_xor_assign] = "^=",
+  [NI_TK_bitwise_or_assign] = "|=",
+  [NI_TK_bitwise_and_assign] = "&=",
+  [NI_TK_add_assign] = "+=",
+  [NI_TK_saturated_add_assign] = "++=",
+  [NI_TK_sub_assign] = "-=",
+  [NI_TK_saturated_sub_assign] = "--=",
+  [NI_TK_mult_assign] = "*=",
+  [NI_TK_saturated_mult_assign] = "**=",
+  [NI_TK_div_assign] = "/=",
+  [NI_TK_pymod_assign] = "%=",
+  // TODO: redo
+  [NI_TK_cmod_assign] = "%%=",
+  [NI_TK_dot] = ".",
+  [NI_TK_comma] = ",",
+  [NI_TK_semicolon] = ";",
+  [NI_TK_colon] = ":",
+  [NI_TK_open_rounded] = "(",
+  [NI_TK_close_rounded] = ")",
+  [NI_TK_open_curly] = "{",
+  [NI_TK_close_curly] = "}",
+  [NI_TK_open_bracket] = "[",
+  [NI_TK_close_bracket] = "]",
 };
 
-StringView c_keyword_sv[_C_KW_count];
-
-// https://en.cppreference.com/c/language/punctuators
-typedef enum {
-  C_TK_newline,
-  C_TK_whitespace,
-  C_TK_multiline_comment,
-  C_TK_singleline_comment,
-  // Note that order here matches greedy lexing, e.g. "[[" is before "[" and so forth.
-  _C_TK_punct_start,
-  C_TK_attr_start,         // aka "[["
-  C_TK_attr_scope,         // aka "::"
-  C_TK_attr_end,           // aka "]]"
-  C_TK_shift_left_assign,  // aka "<<="
-  C_TK_shift_right_assign, // aka ">>="
-  C_TK_equal,              // aka "=="
-  C_TK_not_equal,          // aka "!="
-  C_TK_less_equal,         // aka "<="
-  C_TK_greater_equal,      // aka ">="
-  C_TK_logic_and,          // aka "&&"
-  C_TK_logic_or,           // aka "||"
-  C_TK_shift_left,         // aka "<<"
-  C_TK_shift_right,        // aka ">>"
-  C_TK_incr,               // aka "++"
-  C_TK_decr,               // aka "--"
-  C_TK_open_paren,
-  C_TK_close_paren,
-  C_TK_open_curly,
-  C_TK_close_curly,
-  C_TK_open_bracket,
-  C_TK_close_bracket,
-  C_TK_semicolon,
-  C_TK_colon,
-  C_TK_ellipsis,
-  C_TK_question,
-  C_TK_member,        // aka "."
-  // Note that arrow should come before "-" and ">" for greedy lexing.
-  C_TK_member_ptr,    // aka "->"
-  C_TK_tilde,         // aka "~"
-  C_TK_exclamation,   // aka "!"
-  C_TK_plus_equal,
-  C_TK_minus_equal,
-  C_TK_mult_equal,    // aka "*="
-  C_TK_div_equal,     // aka "/="
-  C_TK_mod_equal,     // aka "%="
-  C_TK_bit_xor_equal, // aka "^="
-  C_TK_bit_or_equal,  // aka "|="
-  C_TK_bit_and_equal, // aka "&="
-  C_TK_plus,
-  C_TK_minus,
-  C_TK_div,           // aka "/"
-  C_TK_mod,           // aka "%"
-  C_TK_bit_xor,       // aka "^"
-  C_TK_bit_or,        // aka "|"
-  C_TK_ampersand,     // aka "&"
-  C_TK_assign,        // aka "="
-  C_TK_less,          // aka "<"
-  C_TK_greater,       // aka ">"
-  C_TK_comma,         // aka ","
-  _C_TK_punct_end,
-
-  C_TK_keyword,
-  C_TK_identifier,
-  C_TK_eof,
-  C_TK_error,
-} CTokenKind;
-
-static const char* c_punct_cstr[_C_TK_punct_end] = {
-  [C_TK_attr_start]         = "[[",
-  [C_TK_attr_scope]         = "::",
-  [C_TK_attr_end]           = "]]",
-  [C_TK_shift_left_assign]  = "<<=",
-  [C_TK_shift_right_assign] = ">>=",
-  [C_TK_equal]              = "==",
-  [C_TK_not_equal]          = "!=",
-  [C_TK_less_equal]         = "<=",
-  [C_TK_greater_equal]      = ">=",
-  [C_TK_logic_and]          = "&&",
-  [C_TK_logic_or]           = "||",
-  [C_TK_shift_left]         = "<<",
-  [C_TK_shift_right]        = ">>",
-  [C_TK_incr]               = "++",
-  [C_TK_decr]               = "--",
-  [C_TK_open_paren]         = "(",
-  [C_TK_close_paren]        = ")",
-  [C_TK_open_curly]         = "{",
-  [C_TK_close_curly]        = "}",
-  [C_TK_open_bracket]       = "[",
-  [C_TK_close_bracket]      = "]",
-  [C_TK_semicolon]          = ";",
-  [C_TK_colon]              = ":",
-  [C_TK_ellipsis]           = "...",
-  [C_TK_question]           = "?",
-  [C_TK_member]             = ".",
-  [C_TK_member_ptr]         = "->",
-  [C_TK_tilde]              = "~",
-  [C_TK_exclamation]        = "!",
-  [C_TK_plus_equal]         = "+=",
-  [C_TK_minus_equal]        = "-=",
-  [C_TK_mult_equal]         = "*=",
-  [C_TK_div_equal]          = "/=",
-  [C_TK_mod_equal]          = "%=",
-  [C_TK_bit_xor_equal]      = "^=",
-  [C_TK_bit_or_equal]       = "|=",
-  [C_TK_bit_and_equal]      = "&=",
-  [C_TK_plus]               = "+",
-  [C_TK_minus]              = "-",
-  [C_TK_div]                = "/",
-  [C_TK_mod]                = "%",
-  [C_TK_bit_xor]            = "^",
-  [C_TK_bit_or]             = "|",
-  [C_TK_ampersand]          = "&",
-  [C_TK_assign]             = "=",
-  [C_TK_less]               = "<",
-  [C_TK_greater]            = ">",
-  [C_TK_comma]              = ",",
-};
-
-StringView c_punct_sv[_C_TK_punct_end];
-
-typedef enum {
-  C_TK_error_unclosed_multiline_comment,
-  C_TK_error_encountered_null_term,
-  C_TK_error_encountered_unexpected_symbol,
-  _C_TK_error_count,
-} CTokenError;
-
-static const char* c_token_error_cstr[_C_TK_error_count] = {
-  [C_TK_error_unclosed_multiline_comment]    = "Unclosed multiline comment.",
-  [C_TK_error_encountered_null_term]         = "Encountered null term. Provided string view should not include it.",
-  [C_TK_error_encountered_unexpected_symbol] = "Encountered unexpected symbol.",
-};
-
-StringView c_token_error_sv[_C_TK_error_count];
+StringView ni_token_sv[_NI_TK_count];
 
 typedef struct {
-  // TODO: source file
-  StringView source_file_name;
-  size_t line;
-  size_t position_in_line;
-  CTokenKind kind;
+  // TODO: struct of arrays
+  size_t position_in_file;
+  NiTokenKind kind;
   union {
-    size_t whitespace;
-    CKeyword keyword;
-    StringArenaRef identifier;
-    StringArenaRef comment;
-    CTokenError error;
-    // TODO: for unexpected symbol, store byte
+    // TODO: probably makes sense to shrink it to U16?
+    size_t identifier_length;
+    size_t literal_length;
   };
-} CToken;
+} NiToken;
 
-typedef struct {
-  CToken* data;
-  size_t count;
-  size_t capacity;
-} CTokenDA;
+MAKE_TYPED_ARENA_DEFINITION(NiToken, NiTokenArena, ni_token_arena_init, ni_token_arena_alloc, ni_token_arena_append);
 
-#define c_token_da_ptr_last(target) (target)->data[(target)->count - 1]
-#define c_token_da_last(target) (target).data[(target).count - 1]
-
-static void c_token_da_extend(CTokenDA* const target, size_t capacity) {
-  target->data = realloc(target->data, capacity * sizeof(target->data[0]));
-  target->capacity = capacity;
-}
-
-static void c_token_da_append(CTokenDA* const target, const CToken* const elem) {
-  if (target->count + 1 >= target->capacity) {
-    if (target->capacity == 0) {
-      c_token_da_extend(target, 4096);
-    } else {
-      c_token_da_extend(target, target->capacity * 2);
-    };
-  };
-  target->data[target->count] = *elem;
-  ++target->count;
-}
-
-/*
-void c_token_da_concat_no_overlap(CTokenDA* const restrict dest, const CTokenDA* const restrict src) {
-  size_t new_count = dest->count + src->count;
-  if (new_count >= dest->capacity) {
-    c_token_da_extend(dest, MAX(new_count, dest->capacity * 2));
-  };
-  memcpy(dest->data, src->data, new_count * sizeof(dest->data[0]));
-  dest->count = new_count;
-}
-*/
-
-typedef struct {
-  CTokenDA result;
-  StringView buffer;
-  size_t current_line;
-  size_t beginning_of_current_line;
-  // Something like StringView remainding_buffer;
-  size_t cursor;
-} CTokenizerState;
-
-static CToken generic_token_with_current_state(CTokenizerState* const state, const CTokenKind kind) {
-  // TODO: file, line and pos, are we expanding a macro, etc
-  return (CToken){.kind = kind};
-}
-
-static CToken multiline_comment_token_with_current_state(CTokenizerState* const state, const StringArenaRef comment) {
-  // TODO: file, line and pos, are we expanding a macro, etc
-  return (CToken){.kind = C_TK_multiline_comment, .comment = comment};
-}
-
-static CToken singleline_comment_token_with_current_state(CTokenizerState* const state, const StringArenaRef comment) {
-  // TODO: file, line and pos, are we expanding a macro, etc
-  return (CToken){.kind = C_TK_singleline_comment, .comment = comment};
-}
-
-static CToken whitespace_token_with_current_state(CTokenizerState* const state, const size_t whitespace) {
-  return (CToken){.kind = C_TK_whitespace, .whitespace = whitespace};
-}
-
-static CToken keyword_token_with_current_state(CTokenizerState* const state, const CKeyword keyword) {
-  // TODO: file, line and pos, are we expanding a macro, etc
-  return (CToken){.kind = C_TK_keyword, .keyword = keyword};
-}
-
-
-static CToken identifier_token_with_current_state(CTokenizerState* const state, const StringArenaRef identifier) {
-  // TODO: file, line and pos, are we expanding a macro, etc
-  return (CToken){.kind = C_TK_identifier, .identifier = identifier};
-}
-
-static CToken error_token_with_current_state(CTokenizerState* const state, const CTokenError error) {
-  // TODO: file, line and pos, are we expanding a macro, etc
-  return (CToken){.kind = C_TK_error, .error = error};
-}
-
-static void evaluate_preprocessor_directive(CTokenizerState* const state) {
-  // TODO: handle directives
-}
-
+#if 0
 static void consume_newline(CTokenizerState* const state, bool prev_was_cr) {
   ++state->cursor;
   // Dealing with microslop's and apple's bullshit:
@@ -478,7 +730,8 @@ static void consume_newline(CTokenizerState* const state, bool prev_was_cr) {
   state->beginning_of_current_line = state->cursor;
   
   CToken next = generic_token_with_current_state(state, C_TK_newline);
-  c_token_da_append(&state->result, &next);
+  // c_token_da_append(&state->result, &next);
+  c_token_arena_append(&state->result, &next);
 
   return;
 }
@@ -491,341 +744,528 @@ static bool try_consuming_newline(CTokenizerState* const state) {
   }
   return false;
 }
+#endif
 
-static bool try_consuming_singleline_comment(StringArena* const comment_arena, CTokenizerState* const state) {
-  if (state->cursor + 1 >= state->buffer.count) {
-    return false;
-  }
-  StringView next2chars = sv_slice(state->buffer, state->cursor, state->cursor + 2);
-  if (!sv_equal(next2chars, sv_from_cstr("//"))) {
-    return false;
-  }
-  state->cursor += 2;
-  size_t start_cursor = state->cursor;
-  bool consumed_newline;
-  while (state->cursor < state->buffer.count && !(consumed_newline = try_consuming_newline(state))) {
-    ++state->cursor;
-  }
-  if (comment_arena != NULL) {
-    // -(size_t)consumed_newline is so we don't count newline as part of the comment.
-    size_t comm_len = string_arena_append_sv(comment_arena, sv_slice(state->buffer, start_cursor, state->cursor - (size_t)consumed_newline));
-    StringArenaRef comment = make_string_arena_ref(comment_arena, comm_len);
-    CToken next = singleline_comment_token_with_current_state(state, comment);
-    c_token_da_append(&state->result, &next);
-  } else {
-    CToken next = singleline_comment_token_with_current_state(state, (StringArenaRef){0});
-    c_token_da_append(&state->result, &next);
-  }
-  return true;
-}
-static bool try_consuming_multiline_comment(StringArena* const comment_arena, CTokenizerState* const state) {
-  if (state->cursor + 1 >= state->buffer.count) {
-    return false;
-  }
-  StringView next2chars = sv_slice(state->buffer, state->cursor, state->cursor + 2);
-  if (!sv_equal(next2chars, sv_from_cstr("/*"))) {
-    return false;
-  }
-  state->cursor += 2;
-  size_t start_cursor = state->cursor;
-  CToken next = {0};
-  while (state->cursor + 1 < state->buffer.count) {
-    next2chars = sv_slice(state->buffer, state->cursor, state->cursor + 2);
-    if (!sv_equal(next2chars, sv_from_cstr("*/"))) {
-      ++state->cursor;
-      continue;
-    }
-    // TODO: this shitshow will be simplified in nilang
-    if (comment_arena != NULL) {
-      size_t comm_len = string_arena_append_sv(comment_arena, sv_slice(state->buffer, start_cursor, state->cursor));
-      StringArenaRef comment = make_string_arena_ref(comment_arena, comm_len);
-      next = multiline_comment_token_with_current_state(state, comment);
-    } else {
-      next = multiline_comment_token_with_current_state(state, (StringArenaRef){0});
-    }
-    c_token_da_append(&state->result, &next);
-    state->cursor += 2;
-    return true;
-  }
-  // Because we have stopped when there was only a single character left.
-  ++state->cursor;
-  next = error_token_with_current_state(state, C_TK_error_unclosed_multiline_comment);
-  c_token_da_append(&state->result, &next);
-  // Even though this is an error, we advanced the state, so returning true.
-  return true;
-}
+#if 0
+  [NI_TK_bitwise_negate] = "~",
+  [NI_TK_bool_negate] = "!",
+  [NI_TK_plus] = "+",
+  [NI_TK_minus] = "-",
+  [NI_TK_ampersand] = "&",
+  [NI_TK_equal] = "==",
+  [NI_TK_not_equal] = "!=",
+  [NI_TK_less] = "<",
+  [NI_TK_less_equal] = "<=",
+  [NI_TK_greater] = ">",
+  [NI_TK_greater_equal] = ">=",
+  [NI_TK_logic_or] = "||",
+  [NI_TK_logic_and] = "&&",
+  [NI_TK_shift_left] = "<<",
+  [NI_TK_shift_right] = ">>",
+  [NI_TK_most_significant_bit] = ">|",
+  [NI_TK_count_trailing_zeros] = "|<",
+  [NI_TK_bitwise_xor] = "^",
+  [NI_TK_bitwise_or] = "|",
+  [NI_TK_saturated_plus] = "++",
+  [NI_TK_saturated_minus] = "--",
+  [NI_TK_mult] = "*",
+  [NI_TK_saturated_mult] = "**",
+  [NI_TK_div] = "/",
+  [NI_TK_pymod] = "%",
+  // TODO: redo
+  [NI_TK_cmod] = "%%",
+  [NI_TK_assign] = "=",
+  [NI_TK_shift_left_assign] = "<<=",      !!
+  [NI_TK_shift_right_assign] = ">>=",
+  [NI_TK_bitwise_xor_assign] = "^=",
+  [NI_TK_bitwise_or_assign] = "|=",
+  [NI_TK_bitwise_and_assign] = "&=",
+  [NI_TK_plus_assign] = "+=",
+  [NI_TK_saturated_plus_assign] = "++=",
+  [NI_TK_minus_assign] = "-=",
+  [NI_TK_saturated_minus_assign] = "--=", !!
+  [NI_TK_mult_assign] = "*=",
+  [NI_TK_saturated_mult_assign] = "**=",
+  [NI_TK_div_assign] = "/=",
+  [NI_TK_pymod_assign] = "%=",
+  // TODO: redo
+  [NI_TK_cmod_assign] = "%%=",
+  [NI_TK_dot] = ".",
+  [NI_TK_comma] = ",",
+  [NI_TK_semicolon] = ";",
+  [NI_TK_open_parenthesis] = "(",
+  [NI_TK_close_parenthesis] = ")",
+  [NI_TK_open_curly] = "{",
+  [NI_TK_close_curly] = "}",
+  [NI_TK_open_bracket] = "[",
+  [NI_TK_close_bracket] = "]",
+#endif
 
-static void consume_whitespace(CTokenizerState* const state, size_t whitespace) {
-  if (state->result.count == 0 || c_token_da_last(state->result).kind != C_TK_whitespace) {
-    CToken next = whitespace_token_with_current_state(state, whitespace);
-    c_token_da_append(&state->result, &next);
-  } else {
-    c_token_da_last(state->result).whitespace += whitespace;
-  }
-  ++state->cursor;
-  return;
-}
-
-static bool try_consuming_whitespace(const TokenizerConfig* const config, CTokenizerState* const state) {
-  if (state->buffer.data[state->cursor] == '\t') {
-    consume_whitespace(state, config->tab_size);
-    return true;
-  } else if (isspace(state->buffer.data[state->cursor])) {
-    consume_whitespace(state, 1);
-    return true;
-  }
-  return false;
-}
-
-static bool try_consuming_punct(CTokenizerState* const state) {
-  StringView punct_sv = {0};
-  for (CTokenKind punct_index = _C_TK_punct_start + 1; punct_index < _C_TK_punct_end; ++punct_index) {
-    punct_sv = c_punct_sv[punct_index];
-    if (state->buffer.count < state->cursor + punct_sv.count) {
-      continue;
-    } 
-    if (sv_equal(sv_slice(state->buffer, state->cursor, state->cursor + punct_sv.count), punct_sv)) {
-      CToken next = generic_token_with_current_state(state, punct_index);
-      c_token_da_append(&state->result, &next);
-      state->cursor += punct_sv.count;
-      return true;
+size_t from_start_length_of_sequence_of_alphanumeric_or_underscore(StringView const buffer) {
+  // TODO: simd, shuffle && nibble trick
+  size_t i = 0;
+  uint8_t cur_char = 0;
+  for (; i < buffer.count; i += 1) {
+    cur_char = buffer.data[i];
+    // TODO: lookup table
+    if (!(('A' <= cur_char && cur_char <= 'Z') ||
+	  ('a' <= cur_char && cur_char <= 'z') ||
+	  ('0' <= cur_char && cur_char <= '9') ||
+	  cur_char == '_')) {
+      break;
     }
   }
-  return false;
+  return i;
 }
 
-static bool try_consuming_keyword(CTokenizerState* const state) {
-  StringView kw_sv = {0};
-  for (CKeyword kw_index = 0; kw_index < _C_KW_count; ++kw_index) {
-    kw_sv = c_keyword_sv[kw_index];
-    if (state->buffer.count < state->cursor + kw_sv.count) {
+typedef enum {
+  _NI_TK_ERR_zero_stub,
+  NI_TK_ERR_base10_literal_base16_lowercase,
+  NI_TK_ERR_base10_literal_base16_uppercase,
+  NI_TK_ERR_base10_literal_alpha_or_underscore,
+} NiTokenizationError;
+
+MAKE_TYPED_ARENA_DEFINITION(NiTokenizationError, NiTokenizationErrorArena, ni_tokenization_error_arena_init, ni_tokenization_error_arena_alloc, ni_tokenization_error_arena_append);
+
+typedef struct {
+  size_t length;
+  NiTokenizationError status;
+} _Base10ParseRes;
+
+_Base10ParseRes from_start_length_of_sequence_of_numeric_base10(StringView const buffer) {
+  // TODO: simd, shuffle && nibble trick
+  size_t i = 0;
+  uint8_t cur_char = 0;
+  NiTokenizationError status = _NI_TK_ERR_zero_stub;
+  for (; i < buffer.count; i += 1) {
+    cur_char = buffer.data[i];
+    // TODO: lookup table
+    if ('0' <= cur_char && cur_char <= '9') {
       continue;
-    } 
-    if (sv_equal(sv_slice(state->buffer, state->cursor, state->cursor + kw_sv.count), kw_sv)) {
-      CToken next = keyword_token_with_current_state(state, kw_index);
-      c_token_da_append(&state->result, &next);
-      state->cursor += kw_sv.count;
-      return true;
     }
-    // TODO: check additional spellings like __restrict__
-  }
-  return false;
-}
-
-static bool is_identifier_continuation(const char c) {
-  return isalnum(c) || c == '_';
-}
-
-// TODO: fully standard-compliant reading of identifiers
-// https://en.cppreference.com/c/language/identifier
-// TODO: this can be simdified
-static bool try_consuming_identifier(StringArena* const identifier_arena, CTokenizerState* const state) {
-  char head = state->buffer.data[state->cursor];
-  if (!isalpha(head) && head != '_') {
-    return false;
-  }
-  size_t start_cursor = state->cursor;
-  while (state->cursor < state->buffer.count && is_identifier_continuation(state->buffer.data[state->cursor])) {
-    ++state->cursor;
-  }
-  size_t id_len = string_arena_append_sv(identifier_arena, sv_slice(state->buffer, start_cursor, state->cursor));
-  StringArenaRef identifier = make_string_arena_ref(identifier_arena, id_len);
-  CToken next = identifier_token_with_current_state(state, identifier);
-  c_token_da_append(&state->result, &next);
-  return true;
-}
-
-CTokenDA preprocess_and_tokenize(const TokenizerConfig* const config,
-		StringArena* const macro_identifier_arena,
-		StringArena* const comment_arena,
-		StringArena* const identifier_arena,
-		StringView buffer) {
-  CTokenizerState state = {.buffer = buffer};
-
-  CToken next = {0};
-  // TODO: redo this via simd.
-  do {
-    // Invariant: there is always at least one symbol under the cursor.
-    // If you need more, check the length.
-    if (state.cursor >= state.buffer.count) {
-      next = generic_token_with_current_state(&state, C_TK_eof);
-      c_token_da_append(&state.result, &next);
+    if ('A' <= cur_char && cur_char <= 'Z') {
+      switch (status) {
+        case _NI_TK_ERR_zero_stub:
+          status = NI_TK_ERR_base10_literal_base16_uppercase;
+	  break;
+	case NI_TK_ERR_base10_literal_base16_lowercase:
+	  status = NI_TK_ERR_base10_literal_alpha_or_underscore;
+	  break;
+	default: break;
+      }
       continue;
-    } else if (state.buffer.data[state.cursor] == '\0') {
-      next = error_token_with_current_state(&state, C_TK_error_encountered_null_term);
-      c_token_da_append(&state.result, &next);
+    }
+    if ('a' <= cur_char && cur_char <= 'z') {
+      switch (status) {
+        case _NI_TK_ERR_zero_stub:
+          status = NI_TK_ERR_base10_literal_base16_lowercase;
+	  break;
+	case NI_TK_ERR_base10_literal_base16_uppercase:
+	  status = NI_TK_ERR_base10_literal_alpha_or_underscore;
+	  break;
+	default: break;
+      }
       continue;
-    } else if (state.buffer.data[state.cursor] == '#') {
-      // TODO: update all state
-      ++state.cursor;
-      // TODO: noop for now
-      evaluate_preprocessor_directive(&state);
+    }
+    if (cur_char == '_') {
+      status = NI_TK_ERR_base10_literal_alpha_or_underscore;
       continue;
-    // TODO: whether or not to keep comments should be part of global config
-    } else if (try_consuming_singleline_comment(comment_arena, &state)) {
+    }
+    if ('0' <= cur_char && cur_char <= '9') {
       continue;
-    } else if (try_consuming_multiline_comment(comment_arena, &state)) {
-      continue;
-    // TODO: whether or not to keep newlines should be part of global config
-    } else if (try_consuming_newline(&state)) {
-      continue;
-    // TODO: keeping whitespace makes no sense
-    } else if (try_consuming_whitespace(config, &state)) {
-      continue;
-    } else if (try_consuming_punct(&state)) {
-      continue;
-    // We try to consume keywords first so they do not accidentally get counted as identifiers.
-    } else if (try_consuming_keyword(&state)) {
-      continue;
-    } else if (try_consuming_identifier(identifier_arena, &state)) {
-      // TODO: expand identifiers which are preprocessor tokens
-      continue;
-    };
-    next = error_token_with_current_state(&state, C_TK_error_encountered_unexpected_symbol);
-    c_token_da_append(&state.result, &next);
-    fprintf(stderr, "could not consume anything\n");
+    }
     break;
-  } while (c_token_da_last(state.result).kind != C_TK_eof && c_token_da_last(state.result).kind != C_TK_error);
+  }
 
-  return state.result;
+  return (_Base10ParseRes){i, status};
 }
 
-static StringView c_token_to_debug_sv(StringArena* const a,
-		                      const StringArena* const comment_arena,
-		                      const StringArena* const identifier_arena,
-				      const CToken* const token) {
+MAKE_TYPED_ARENA_DEFINITION(size_t, USizeArena, usize_arena_init, usize_arena_alloc, usize_arena_append);
+
+void skip_whitespaces_and_mark_newline_indexes(size_t* cursor, StringView const buffer, USizeArena* const newline_indexes_arena) {
+  // TODO: simd
+  // Note: I know this all is extremely awkward code, it will be way less awkward after being transformed to simd.
+  // So there is no point in making it be good.
+  uint16_t next_two_chars = 0;
+  uint8_t cur_char = 0;
+  while (*cursor + 1 < buffer.count) {
+    memcpy(&next_two_chars, &buffer.data[*cursor], 2);
+    if (next_two_chars == 0x0A0D) { // "\r\n"
+      usize_arena_append(newline_indexes_arena, cursor);
+      *cursor += 2;
+      continue;
+    }
+    cur_char = buffer.data[*cursor];
+    // TODO: LUT
+    if (cur_char == '\r' || cur_char == '\n') {
+      usize_arena_append(newline_indexes_arena, cursor);
+      *cursor += 1;
+      continue;
+    }
+    if (cur_char == ' ' || cur_char == '\f' || cur_char == '\t' || cur_char == '\v') {
+      *cursor += 1;
+      continue;
+    }
+    break;
+  }
+  if (*cursor < buffer.count) {
+    cur_char = buffer.data[*cursor];
+    if (cur_char == '\r' || cur_char == '\n') {
+      usize_arena_append(newline_indexes_arena, cursor);
+      *cursor += 1;
+    }
+    if (cur_char == ' ' || cur_char == '\f' || cur_char == '\t' || cur_char == '\v') {
+      *cursor += 1;
+    }
+  }
+}
+
+NiTokenKind classify_identifier(StringView const identifier_sv) {
+  // TODO: everything else.
+  switch (identifier_sv.count) {
+    case 2: {
+      uint16_t as_U16 = 0;
+      memcpy(&as_U16, identifier_sv.data, 2);
+      switch (as_U16) {
+        case 0x6669: return NI_TK_if;
+        case 0x3855: return NI_TK_U8;
+        default:     return NI_TK_identifier;
+      }
+    }
+    case 3: {
+      uint32_t as_U32 = 0;
+      memcpy(&as_U32, identifier_sv.data, 3);
+      switch (as_U32) {
+        case 0x00343655: return NI_TK_U64;
+        default:         return NI_TK_identifier;
+      }
+    }
+    case 5: {
+      uint64_t as_U64 = 0;
+      memcpy(&as_U64, identifier_sv.data, 5);
+      switch (as_U64) {
+        case 0x00000065736C6166: return NI_TK_false;
+        default:                 return NI_TK_identifier;
+      }
+    }
+    default: return NI_TK_identifier;
+  }
+}
+
+typedef struct {
+  NiTokenArena token_arena;
+  NiTokenizationErrorArena error_arena;
+  USizeArena newline_indexes_arena;
+} NiTokenizationResult;
+
+// TODO: do identifier storage with hashmap to save memory and make everybody's life easier
+// TODO: store non-semantic tokens (newlines, comments) separately.
+NiTokenizationResult nic_tokenize(StringView const buffer) {
+  // TODO: init error arena
+  // TODO: better heuristics for sizes of arenas
+  NiTokenArena token_arena = ni_token_arena_init(buffer.count * sizeof(NiToken), buffer.count);
+  USizeArena newline_indexes_arena = usize_arena_init(buffer.count * sizeof(size_t), buffer.count);
+  size_t cursor = 0;
+
+  NiToken next = {0};
+  // TODO: while true
+  for (;; ni_token_arena_append(&token_arena, &next)) {
+    // TODO: skip whitespaces and newlines
+    skip_whitespaces_and_mark_newline_indexes(&cursor, buffer, &newline_indexes_arena);
+    if (cursor >= buffer.count) {
+      break;
+    }
+    next.position_in_file = cursor;
+    // Check on how many characters are remaining, clamped to 3, since it is the number of lookahead characters.
+    switch (MIN((buffer.count - cursor), 3)) {
+      case 3: {
+        // TODO: video about strict aliasing
+        uint32_t next_characters = 0;
+        memcpy(&next_characters, &buffer.data[cursor], 3);
+        // Values here were obtained via helper executable "string_to_int".
+        // This will be a builtin feature of nilang.
+        switch (next_characters) {
+          case 0x003D3C3C: // "<<="
+            next.kind = NI_TK_shift_left_assign;
+            break;
+          case 0x003D2D2D: // "--="
+            next.kind = NI_TK_saturated_sub_assign;
+            break;
+          default:
+            next.kind = _NI_TK_zero_stub;
+            break;
+        }
+        if (next.kind != _NI_TK_zero_stub) {
+          cursor += 3;
+          continue;
+        }
+      }
+      [[fallthrough]];
+      case 2: {
+        uint16_t next_characters = 0;
+        memcpy(&next_characters, &buffer.data[cursor], 2);
+        // TODO: sort, perfect hashing
+        switch (next_characters) {
+          case 0x3D3C: // "<="
+            next.kind = NI_TK_less_equal;
+            break;
+          case 0x3D2B: // "+="
+            next.kind = NI_TK_add_assign;
+            break;
+          case 0x2B2B: // "++"
+            next.kind = NI_TK_saturated_add;
+            break;
+          case 0x2626: // "&&"
+            next.kind = NI_TK_logic_and;
+            break;
+          default:
+            next.kind = _NI_TK_zero_stub;
+            break;
+        }
+        if (next.kind != _NI_TK_zero_stub) {
+          cursor += 2;
+          continue;
+        }
+      }
+      [[fallthrough]];
+      case 1: {
+        uint8_t next_character = 0;
+        memcpy(&next_character, &buffer.data[cursor], 1);
+        // TODO: sort, perfect hashing
+        switch (next_character) {
+          case ':':
+            next.kind = NI_TK_colon;
+            break;
+          case ';':
+            next.kind = NI_TK_semicolon;
+            break;
+          case '.':
+            next.kind = NI_TK_dot;
+            break;
+          case '=':
+            next.kind = NI_TK_assign;
+            break;
+          case '~':
+            next.kind = NI_TK_bitwise_negate;
+            break;
+          case '!':
+            next.kind = NI_TK_bool_negate;
+            break;
+          case '+':
+            next.kind = NI_TK_add;
+            break;
+          case '-':
+            next.kind = NI_TK_minus;
+            break;
+          case '*':
+            next.kind = NI_TK_mult;
+            break;
+          case '{':
+            next.kind = NI_TK_open_curly;
+            break;
+          case '}':
+            next.kind = NI_TK_close_curly;
+            break;
+          case '(':
+            next.kind = NI_TK_open_rounded;
+            break;
+          case ')':
+            next.kind = NI_TK_close_rounded;
+            break;
+          default:
+            next.kind = _NI_TK_zero_stub;
+            break;
+        }
+        if (next.kind != _NI_TK_zero_stub) {
+          cursor += 1;
+          continue;
+        }
+        // TODO: in nilang we will have switches on ranges instead
+        if (('A' <= next_character && next_character <= 'Z') ||
+            ('a' <= next_character && next_character <= 'z') ||
+            next_character == '_') {
+          // We add one to start, because identifiers can contain numbers, but should not begin with one.
+          size_t length_after_first = from_start_length_of_sequence_of_alphanumeric_or_underscore(sv_slice(buffer, cursor + 1, buffer.count));
+	  size_t length = length_after_first + 1;
+	  // TODO: check if length is >= 1<<16 and report error if so.
+          next.kind = classify_identifier(sv_slice(buffer, cursor, cursor + length));
+	  // No point in doing select here, we won't really lose anything from always writing that.
+          next.identifier_length = length;
+          cursor += length;
+          continue;
+        }
+        if ('0' <= next_character && next_character <= '9') {
+	  // TODO: detect suffixes like "ULL" and co
+          auto _base10_res = from_start_length_of_sequence_of_numeric_base10(sv_slice(buffer, cursor, buffer.count));
+          next.kind = NI_TK_base10_literal;
+          // TODO: push error
+          next.literal_length = _base10_res.length;
+          cursor += _base10_res.length;
+          continue;
+        }
+        // TODO: handle this properly.
+        fprintf(stderr, "UNEXPECTED CHARACTER: %c, hex: 0x%02X\n", buffer.data[cursor], buffer.data[cursor]);
+        exit(1);
+      }
+    }
+  }
+
+  return (NiTokenizationResult){token_arena, {0}, newline_indexes_arena};
+}
+
+static StringView ni_token_to_debug_sv(StringArena* const target,
+				       const NiToken* const token,
+				       StringView const buffer) {
   StringView res = {0};
+  // TODO: in nilang, we will have switches on ranges
+  if (_NI_TK_stringifiable_start <= token->kind && token->kind < _NI_TK_stringifiable_end) {
+    res.count += string_arena_append_sv(target, ni_token_sv[token->kind]);
+    res.data = target->data + target->count - res.count;
+    return res;
+  }
   switch (token->kind) {
-    case C_TK_newline:
-      res.count += string_arena_append_sv(a, sv_from_cstr("newline"));
+    case _NI_TK_zero_stub:
+      res.count += string_arena_append_sv(target, sv_from_cstr("zero stub"));
       break;
-    case C_TK_multiline_comment:
-      res.count += string_arena_append_sv(a, sv_from_cstr("multiline_comment - "));
-      // TODO: account for config
-      res.count += string_arena_append_sv(a, string_arena_ref_to_sv(comment_arena, &token->comment));
+    case NI_TK_identifier: {
+      res.count += string_arena_append_sv(target, sv_from_cstr("identifier"));
+      StringView id = sv_slice(buffer, token->position_in_file, token->position_in_file + (size_t)token->identifier_length);
+      // fprintf(stderr, "%.*s\n", (int)id.count, id.data);
+      res.count += string_arena_printf(target, ": %.*s", (int)id.count, id.data);
       break;
-    case C_TK_singleline_comment:
-      res.count += string_arena_append_sv(a, sv_from_cstr("singleline_comment - "));
-      // TODO: account for config
-      res.count += string_arena_append_sv(a, string_arena_ref_to_sv(comment_arena, &token->comment));
+    }
+    case NI_TK_base10_literal: {
+      res.count += string_arena_append_sv(target, sv_from_cstr("base10 numeric literal"));
+      StringView id = sv_slice(buffer, token->position_in_file, token->position_in_file + (size_t)token->literal_length);
+      res.count += string_arena_printf(target, ": %.*s", (int)id.count, id.data);
       break;
-    case C_TK_whitespace:
-      res.count += string_arena_printf(a, "whitespace - %ld", token->whitespace);
-      break;
-    case C_TK_keyword:
-      res.count += string_arena_append_sv(a, sv_from_cstr("keyword - "));
-      res.count += string_arena_append_sv(a, c_keyword_sv[token->keyword]);
-      break;
-    case _C_TK_punct_start:
-      res.count += string_arena_append_sv(a, sv_from_cstr("error - use of internal punct_start"));
-      break;
-    case _C_TK_punct_end:
-      res.count += string_arena_append_sv(a, sv_from_cstr("error - use of internal punct_end"));
-      break;
-    case C_TK_attr_start:         [[fallthrough]];
-    case C_TK_attr_scope:         [[fallthrough]];
-    case C_TK_attr_end:           [[fallthrough]];
-    case C_TK_shift_left_assign:  [[fallthrough]];
-    case C_TK_shift_right_assign: [[fallthrough]];
-    case C_TK_equal:              [[fallthrough]];
-    case C_TK_not_equal:          [[fallthrough]];
-    case C_TK_less_equal:         [[fallthrough]];
-    case C_TK_greater_equal:      [[fallthrough]];
-    case C_TK_logic_and:          [[fallthrough]];
-    case C_TK_logic_or:           [[fallthrough]];
-    case C_TK_shift_left:         [[fallthrough]];
-    case C_TK_shift_right:        [[fallthrough]];
-    case C_TK_incr:               [[fallthrough]];
-    case C_TK_decr:               [[fallthrough]];
-    case C_TK_open_paren:         [[fallthrough]];
-    case C_TK_close_paren:        [[fallthrough]];
-    case C_TK_open_curly:         [[fallthrough]];
-    case C_TK_close_curly:        [[fallthrough]];
-    case C_TK_open_bracket:       [[fallthrough]];
-    case C_TK_close_bracket:      [[fallthrough]];
-    case C_TK_semicolon:          [[fallthrough]];
-    case C_TK_colon:              [[fallthrough]];
-    case C_TK_ellipsis:           [[fallthrough]];
-    case C_TK_question:           [[fallthrough]];
-    case C_TK_member:             [[fallthrough]];
-    case C_TK_member_ptr:         [[fallthrough]];
-    case C_TK_tilde:              [[fallthrough]];
-    case C_TK_exclamation:        [[fallthrough]];
-    case C_TK_plus_equal:         [[fallthrough]];
-    case C_TK_minus_equal:        [[fallthrough]];
-    case C_TK_mult_equal:         [[fallthrough]];
-    case C_TK_div_equal:          [[fallthrough]];
-    case C_TK_mod_equal:          [[fallthrough]];
-    case C_TK_bit_xor_equal:      [[fallthrough]];
-    case C_TK_bit_or_equal:       [[fallthrough]];
-    case C_TK_bit_and_equal:      [[fallthrough]];
-    case C_TK_plus:               [[fallthrough]];
-    case C_TK_minus:              [[fallthrough]];
-    case C_TK_div:                [[fallthrough]];
-    case C_TK_mod:                [[fallthrough]];
-    case C_TK_bit_xor:            [[fallthrough]];
-    case C_TK_bit_or:             [[fallthrough]];
-    case C_TK_ampersand:          [[fallthrough]];
-    case C_TK_assign:             [[fallthrough]];
-    case C_TK_less:               [[fallthrough]];
-    case C_TK_greater:            [[fallthrough]];
-    case C_TK_comma:
-      res.count += string_arena_append_sv(a, sv_from_cstr("punctuator - "));
-      res.count += string_arena_append_sv(a, c_punct_sv[token->kind]);
-      break;
-    case C_TK_identifier:
-      res.count += string_arena_append_sv(a, sv_from_cstr("identifier - "));
-      // TODO: account for config
-      res.count += string_arena_append_sv(a, string_arena_ref_to_sv(comment_arena, &token->identifier));
-      break;
-    case C_TK_eof:
-      res.count += string_arena_append_sv(a, sv_from_cstr("eof"));
-      break;
-    case C_TK_error:
-      res.count += string_arena_append_sv(a, sv_from_cstr("error - "));
-      res.count += string_arena_append_sv(a, c_token_error_sv[token->error]);
+    }
+    default:
       break;
   }
-  res.data = a->data + a->count - res.count;
+  res.data = target->data + target->count - res.count;
   return res;
 }
 
-/*
-StringView tokens_to_sv(StringArena* const a, const CTokenDA* const tokens) {
-  for (size_t i = 0; i < tokens->count; ++i) {
-    string_arena_alloc(a, tokens->data[i]);
-    // TODO: take a string view
-  };
-};
-*/
-
 void init_tokenizer_library(void) {
-  for (CKeyword kw_index = 0; kw_index < _C_KW_count; ++kw_index) {
-    c_keyword_sv[kw_index] = sv_from_cstr(c_keyword_cstr[kw_index]);
-  };
-  for (CTokenKind punct_index = _C_TK_punct_start + 1; punct_index < _C_TK_punct_end; ++punct_index) {
-    c_punct_sv[punct_index] = sv_from_cstr(c_punct_cstr[punct_index]);
-  }
-  for (CTokenError error_index = 0; error_index < _C_TK_error_count; ++error_index) {
-    c_token_error_sv[error_index] = sv_from_cstr(c_token_error_cstr[error_index]);
+  for (NiTokenKind tk_index = _NI_TK_stringifiable_start; tk_index < _NI_TK_stringifiable_end; ++tk_index) {
+    ni_token_sv[tk_index] = sv_from_cstr(ni_token_cstr[tk_index]);
   }
 }
 
-#define TESTTEXT "int restrict ->aboba\n \ngoto b1bab0ba /* ...\n.. , \n{a;  // };*/ }; l33t_h4ker"
+typedef struct {
+  uint64_t i;
+  uint32_t j;
+  uint8_t k;
+  uint32_t l;
+} WeirdSizeofTest;
+
+void init_system_info(void) {
+  system_info.memory_page_size_bytes = sysconf(_SC_PAGESIZE);
+};
+
+/* Arena tests. In nilang, each module will have "executable" section,
+ * which library modules like arenas could use for testing.*/
+MAKE_TYPED_ARENA_DEFINITION(WeirdSizeofTest, WeirdSizeofTestArena, weird_sizeof_test_arena_init, weird_sizeof_test_arena_alloc, weird_sizeof_test_arena_append)
+
+void weird_sizeof_arena_test() {
+  size_t iteration_count = 100000;
+  fprintf(stderr, "Weird sizeof: %ld\n", sizeof(WeirdSizeofTest));
+  WeirdSizeofTestArena weird_sizeof_arena = weird_sizeof_test_arena_init(16*1024*1024, 3200);
+  size_t res_theoretical = 0;
+  WeirdSizeofTest elem = {0};
+  for (uint64_t i = 0; i < iteration_count; ++i) {
+    res_theoretical += (uint64_t)i * 8 + (uint32_t)i * 4 + (uint8_t)i + (uint32_t)i * 4;
+    elem = (WeirdSizeofTest){i * 8, i * 4, i, i * 4};
+    weird_sizeof_test_arena_append(&weird_sizeof_arena, &elem);
+  }
+  fprintf(stderr, "Weird sizeof count after appending: %ld\n", weird_sizeof_arena.count);
+
+  size_t res = 0;
+  for (size_t i = 0; i < (size_t)weird_sizeof_arena.count; ++i) {
+    elem = weird_sizeof_arena.data[i];
+    res += elem.i + elem.j + elem.k + elem.l;
+  }
+  if (res == res_theoretical) {
+    fprintf(stderr, "Weird sizeof test passed: res == res_theoretical == %ld\n", res);
+  } else {
+    fprintf(stderr, "Weird sizeof test failed: res_theoretical == %ld, res == %ld\n", res_theoretical, res);
+  }
+}
+
+typedef struct {
+  uint8_t data[5];
+} OddSizeofTest;
+
+MAKE_TYPED_ARENA_DEFINITION(OddSizeofTest, OddSizeofTestArena, odd_sizeof_test_arena_init, odd_sizeof_test_arena_alloc, odd_sizeof_test_arena_append)
+
+void odd_sizeof_arena_test() {
+  size_t iteration_count = 100000;
+  fprintf(stderr, "Odd sizeof: %ld\n", sizeof(OddSizeofTest));
+  OddSizeofTestArena odd_sizeof_arena = odd_sizeof_test_arena_init(16*1024*1024, 3200);
+  size_t res_theoretical = 0;
+  OddSizeofTest elem = {0};
+  for (uint64_t i = 0; i < iteration_count; ++i) {
+    res_theoretical += (uint8_t)i * 5;
+    elem = (OddSizeofTest){{i, i, i, i, i}};
+    odd_sizeof_test_arena_append(&odd_sizeof_arena, &elem);
+  }
+  fprintf(stderr, "Odd sizeof count after appending: %ld\n", odd_sizeof_arena.count);
+
+  size_t res = 0;
+  for (size_t i = 0; i < (size_t)odd_sizeof_arena.count; ++i) {
+    elem = odd_sizeof_arena.data[i];
+    res += elem.data[0] + elem.data[1] + elem.data[2] + elem.data[3] + elem.data[4];
+  }
+  if (res == res_theoretical) {
+    fprintf(stderr, "Odd sizeof test passed: res == res_theoretical == %ld\n", res);
+  } else {
+    fprintf(stderr, "Odd sizeof test failed: res_theoretical == %ld, res == %ld\n", res_theoretical, res);
+  }
+}
+
+/* End of tests. */
 
 int main(void) {
+  init_system_info();
+  if (false) {
+  weird_sizeof_arena_test();
+  odd_sizeof_arena_test();
+  }
+  auto open_res = open_file("tests/some_arithmetic_operators.ni", O_RDONLY);
+  if (open_res.status != OpenOpStatus_success) {
+    // TODO: string representations of all errors.
+    fprintf(stdout, "Something went wrong while trying to open file.\n");
+    return open_res.status;
+  }
+  StringArena arena = string_arena_init(16*1024*1024, 0);
+  // TODO: function which does stat automatically
+  auto read_res = read_entire_file_descriptor_into_string_arena(open_res.fd, &arena);
+  if (read_res != ReadOpStatus_success) {
+    fprintf(stdout, "Something went wrong while trying to read file.\n");
+    fprintf(stdout, "res: %d.\n", read_res);
+    return read_res;
+  }
+  // TODO: defer
+  close(open_res.fd);
+
+  if (false) {
+  auto write_res = write_entire_file_descriptor(STDOUT_FILENO, *(StringView*)&arena);
+  if (write_res != WriteOpStatus_success) {
+    fprintf(stdout, "Something went wrong while trying to write file.\n");
+    fprintf(stdout, "res: %d.\n", write_res);
+    return write_res;
+  }
+  }
+  fprintf(stderr, "At least read file, arena.count: %ld\n", arena.count);
+  // printf("%.*s", (int)arena.count, arena.data);
   init_tokenizer_library();
-  StringArena macro_identifier_arena = {0};
-  StringArena comment_arena          = {0};
-  StringArena identifier_arena       = {0};
-  StringArena debug_dump_arena       = {0};
-  CTokenDA res = preprocess_and_tokenize(&default_tokenizer_config,
-                                         &macro_identifier_arena,
-                                         &comment_arena,
-					 &identifier_arena,
-					 sv_from_cstr(TESTTEXT));
-  for (size_t i = 0; i < res.count; ++i) {
-    StringView elem_debug_sv = c_token_to_debug_sv(&debug_dump_arena, &comment_arena, &identifier_arena, &res.data[i]);
+  fprintf(stderr, "Initialized tokenizer library.\n");
+  NiTokenizationResult res = nic_tokenize(*(StringView*)&arena);
+  fprintf(stderr, "Tokenized. res.token_arena.count: %ld\n", res.token_arena.count);
+  StringArena debug_dump_arena = string_arena_init(16*1024*1024, 1024*1024);
+  for (size_t i = 0; i < res.token_arena.count; ++i) {
+    StringView elem_debug_sv = ni_token_to_debug_sv(&debug_dump_arena, &res.token_arena.data[i], *(StringView*)&arena);
     fprintf(stderr, "%.*s\n", (int)elem_debug_sv.count, elem_debug_sv.data);
   }
   return 0;
