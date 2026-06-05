@@ -434,6 +434,145 @@ size_t string_arena_printf(StringArena* const target, const char *fmt, ...) {
   return count;
 }
 
+typedef struct {
+  uint64_t key;
+  uint64_t value;
+} U64ToU64HashmapEntry;
+
+// TODO: in nilang, we should probably add something like size_t slots_occupied,
+// and check whether or not putting a thing would put stuff over threshold.
+MAKE_TYPED_ARENA_DEFINITION(U64ToU64HashmapEntry, U64ToU64Hashmap, u64_to_u64_hashmap_init, u64_to_u64_hashmap_alloc, u64_to_u64_hashmap_append);
+
+// Bool is for whether entry with the same key was already in the hashmap.
+bool u64_to_u64_hashmap_insert_unchecked(U64ToU64Hashmap* const hm, U64ToU64HashmapEntry entry) {
+  size_t offset = 0;
+  uint64_t key = entry.key;
+  uint64_t element_under_cursor = hm->data[key % hm->count].key;
+  /*
+  Note (Nilpo):
+  We do not have additional array of sentinel "is_slot_occupied" values.
+  The idea is, if key in slot is equal to zero, then slot is empty.
+  This works because we usually store enums or indexes, and we have "zero_stub" in pretty much all enums.
+  */
+  // TODO: robin hood hashing.
+  // TODO: simd.
+  while (element_under_cursor != 0 && element_under_cursor != key) {
+    ++offset;
+    element_under_cursor = hm->data[(key + offset) % hm->count].key;
+  }
+  hm->data[(key + offset) % hm->count].value = entry.value;
+  return element_under_cursor == key;
+}
+
+typedef struct {
+ bool was_in_hashmap;
+ size_t position;
+} _HashmapGetRes;
+
+_HashmapGetRes u64_to_u64_hashmap_get(const U64ToU64Hashmap* const hm, uint64_t key) {
+  size_t offset = 0;
+  uint64_t element_under_cursor = hm->data[key % hm->count].key;
+  /*
+  Note (Nilpo):
+  We do not have additional array of sentinel "is_slot_occupied" values.
+  The idea is, if key in slot is equal to zero, then slot is empty.
+  This works because we usually store enums or indexes, and we have "zero_stub" in pretty much all enums.
+
+  Note (Nilpo):
+  There is invariant that there are enough empty slots so that search stops quickly.
+  It is maintained by "insert" function.
+  */
+  while (element_under_cursor != 0 && element_under_cursor != key) {
+    ++offset;
+    element_under_cursor = hm->data[(key + offset) % hm->count].key;
+  }
+  return (_HashmapGetRes){element_under_cursor == key, (key + offset) % hm->count};
+}
+
+/*
+Note (nilpo):
+This one is a little complicated.
+First of all, we store all identifiers in a string arena. Each unique identifier is stored only once.
+Usually, you would use size_t (== uint64_t on 64-bit systems) to index start of each identifier,
+and uint16_t to store their length. Effectively, IdentifierReference == std::pair(size_t, uint16_t).
+Now, notice that we don't actually need full 64 bits to index start.
+On most systems, only 48 bits in pointers are actually used. On very few systems, 57 bits.
+TODO: add source.
+48 bits are enough to index 2^^48 == 256TB of memory. The limit is practically impossible to reach.
+This means, we can use first 16 bits to store the length, meaning IdentifierReference fits into single 64 bit integer:
+| length (16 bits) | index of start in arena (48 bits) |.
+This is nice, because now we only need to build a hashmap where value stored is single uint64_t.
+TODO: pack small strings into 48 bits so we don't need to store them in the arena, saving memory.
+*/
+typedef uint64_t IdentifierReference;
+
+// TODO: better hash, simd, use the fact that identifiers have restricted character set.
+// TODO: are we sure this hash is never zero?
+uint64_t fnv_hash(StringView const sv) {
+  uint64_t hash = 0xcbf29ce484222325;
+  for (size_t i = 0; i < sv.count; i++) {
+    hash *= 0x100000001b3;
+    hash ^= (unsigned char)sv.data[i];
+  }
+  return hash;
+}
+
+bool identifier_ref_equal(const StringArena* const identifier_arena,
+                          IdentifierReference const ref,
+                          StringView const key) {
+  /*
+  Note (Nilpo):
+  See explanation on what is happening here at IdentifierReference type description.
+  */
+  if (key.count != (ref >> 48)) {
+    return false;
+  }
+  return !memcmp(&identifier_arena->data[ref & 0x00FFFFFF], key.data, key.count);
+}
+
+MAKE_TYPED_ARENA_DEFINITION(IdentifierReference, IdentifierHashset, identifier_hashset_init, identifier_hashset_alloc, identifier_hashset_append);
+
+IdentifierHashset identifier_hashset_init_with_enough_memory_for_reasonably_low_collision_rate(size_t count) {
+  // TODO: Round to power of two to optimize modulo?
+  // TODO: better heuristic? benchmark
+  size_t slot_count = count * 2;
+  IdentifierHashset res = identifier_hashset_init(slot_count * sizeof(U64ToU64HashmapEntry), slot_count);
+  identifier_hashset_alloc(&res, slot_count);
+  return res;
+}
+
+_HashmapGetRes identifier_hashset_check(const IdentifierHashset* const hm,
+                                        const StringArena* const identifier_arena,
+			                StringView const key) {
+  size_t offset = 0;
+  uint64_t hash = fnv_hash(key);
+  // fprintf(stderr, "hash: %llu, hm_count: %llu\n", hash, hm->count);
+  uint64_t identifier_ref_under_cursor = hm->data[hash % hm->count];
+  // fprintf(stderr, "identifier_ref_under_cursor: %llu\n", identifier_ref_under_cursor);
+  /*
+  Note (Nilpo):
+  We do not have additional array of sentinel "is_slot_occupied" values.
+  The idea is, if key in slot is equal to zero, then slot is empty.
+  In case of identifier references, length of the identifier is never equal to zero, so it's always true.
+  TODO: update description for small string optimization.
+
+  Note (Nilpo):
+  TODO: explain collisions.
+  There is invariant that there are enough empty slots so that search stops quickly.
+  It is maintained by "insert" function.
+  */
+  while (identifier_ref_under_cursor != 0 &&
+         !identifier_ref_equal(identifier_arena, identifier_ref_under_cursor, key)) {
+    ++offset;
+    identifier_ref_under_cursor = hm->data[(hash + offset) % hm->count];
+  }
+  return (_HashmapGetRes){identifier_ref_under_cursor != 0, (hash + offset) % hm->count};
+}
+
+void identifier_hashset_insert_unchecked(const IdentifierHashset* const hm, size_t position, IdentifierReference ref) {
+  hm->data[position] = ref;
+}
+
 typedef enum {
   _NI_TK_zero_stub,
   // TODO: just bool, Bool8 looks stupid.
@@ -705,13 +844,18 @@ static const char* ni_token_cstr[_NI_TK_count] = {
 
 StringView ni_token_sv[_NI_TK_count];
 
+/*
+// Since each unique identifier is only stored once, we can use this integer as a unique hash for types.
+typedef IdentifierReference TypeUID;
+*/
+
 typedef struct {
   // TODO: struct of arrays
   size_t position_in_file;
   NiTokenKind kind;
   union {
-    // TODO: probably makes sense to shrink it to U16?
-    size_t identifier_length;
+    uint16_t identifier_length;
+    IdentifierReference identifier_ref;
     size_t literal_length;
   };
 } NiToken;
@@ -885,7 +1029,7 @@ MAKE_TYPED_ARENA_DEFINITION(size_t, USizeArena, usize_arena_init, usize_arena_al
 void skip_whitespaces_and_mark_newline_indexes(size_t* cursor, StringView const buffer, USizeArena* const newline_indexes_arena) {
   // TODO: simd
   // Note: I know this all is extremely awkward code, it will be way less awkward after being transformed to simd.
-  // So there is no point in making it be good.
+  // So there is no point in making it be good for now.
   uint16_t next_two_chars = 0;
   uint8_t cur_char = 0;
   while (*cursor + 1 < buffer.count) {
@@ -956,15 +1100,26 @@ typedef struct {
   NiTokenArena token_arena;
   NiTokenizationErrorArena error_arena;
   USizeArena newline_indexes_arena;
+  /* Note (Nilpo):
+  identifier_arena actually stores the strings, identifer_indexes_hashset stores references
+  */
+  StringArena identifier_arena;
 } NiTokenizationResult;
 
 // TODO: do identifier storage with hashmap to save memory and make everybody's life easier
 // TODO: store non-semantic tokens (newlines, comments) separately.
 NiTokenizationResult nic_tokenize(StringView const buffer) {
+  // TODO: use var := ... in nilang;
   // TODO: init error arena
   // TODO: better heuristics for sizes of arenas
   NiTokenArena token_arena = ni_token_arena_init(buffer.count * sizeof(NiToken), buffer.count);
   USizeArena newline_indexes_arena = usize_arena_init(buffer.count * sizeof(size_t), buffer.count);
+  StringArena identifier_arena = string_arena_init(buffer.count * sizeof(size_t), buffer.count);
+  /* Note (Nilpo):
+  This one are for internal needs.
+  We first collect the indexes so we can avoid constantly rehashing the identifier hashtable.
+  */
+  USizeArena identifier_indexes_arena = usize_arena_init(buffer.count * sizeof(size_t), buffer.count);
   size_t cursor = 0;
 
   NiToken next = {0};
@@ -1087,10 +1242,12 @@ NiTokenizationResult nic_tokenize(StringView const buffer) {
           // We add one to start, because identifiers can contain numbers, but should not begin with one.
           size_t length_after_first = from_start_length_of_sequence_of_alphanumeric_or_underscore(sv_slice(buffer, cursor + 1, buffer.count));
 	  size_t length = length_after_first + 1;
-	  // TODO: check if length is >= 1<<16 and report error if so.
+	  // TODO: check if length is >= 2^^16 and report error if so.
           next.kind = classify_identifier(sv_slice(buffer, cursor, cursor + length));
-	  // No point in doing select here, we won't really lose anything from always writing that.
-          next.identifier_length = length;
+	  if (next.kind == NI_TK_identifier) {
+            next.identifier_length = length;
+            usize_arena_append(&identifier_indexes_arena, &token_arena.count);
+	  }
           cursor += length;
           continue;
         }
@@ -1109,13 +1266,41 @@ NiTokenizationResult nic_tokenize(StringView const buffer) {
       }
     }
   }
+  
+  // Add each identifier to arena only once and update tokens with "identifier" kind with reference to that arena storage.
+  {
+    IdentifierHashset identifier_references_hashset = identifier_hashset_init_with_enough_memory_for_reasonably_low_collision_rate(identifier_indexes_arena.count);
+    size_t index_in_token_arena = 0;
+    NiToken token = {0};
+    StringView key = {0};
+    size_t index_in_arena = 0;
+    IdentifierReference ref = 0;
+    for (size_t i = 0; i < identifier_indexes_arena.count; ++i) {
+      index_in_token_arena = identifier_indexes_arena.data[i];
+      token = token_arena.data[index_in_token_arena];
+      key = sv_slice(buffer, token.position_in_file, token.position_in_file + (size_t)token.identifier_length);
+      auto _get_res = identifier_hashset_check(&identifier_references_hashset, &identifier_arena, key);
+      if (_get_res.was_in_hashmap) {
+        token_arena.data[index_in_token_arena].identifier_ref = identifier_references_hashset.data[_get_res.position];
+	continue;
+      }
+      index_in_arena = identifier_arena.count;
+      // fprintf(stderr, "inserting %.*s, length: %ld, index_in_arena: %ld\n", (int)key.count, key.data, (uint64_t)token.identifier_length, index_in_arena);
+      string_arena_append_sv(&identifier_arena, key);
+      ref = (((uint64_t)token.identifier_length) << 48) | index_in_arena;
+      // fprintf(stderr, "ref, extracted - length: %ld, start: %ld\n", ref >> 48, ref & 0x00FFFFFF);
+      identifier_hashset_insert_unchecked(&identifier_references_hashset, _get_res.position, ref);
+      token_arena.data[index_in_token_arena].identifier_ref = ref;
+    }
+  }
 
-  return (NiTokenizationResult){token_arena, {0}, newline_indexes_arena};
+  return (NiTokenizationResult){token_arena, {0}, newline_indexes_arena, identifier_arena};
 }
 
-static StringView ni_token_to_debug_sv(StringArena* const target,
-				       const NiToken* const token,
-				       StringView const buffer) {
+static StringView ni_token_to_debug_sv(const StringArena* const identifier_arena,
+                                       StringView const buffer,
+                                       StringArena* const target,
+				       const NiToken* const token) {
   StringView res = {0};
   // TODO: in nilang, we will have switches on ranges
   if (_NI_TK_stringifiable_start <= token->kind && token->kind < _NI_TK_stringifiable_end) {
@@ -1129,8 +1314,10 @@ static StringView ni_token_to_debug_sv(StringArena* const target,
       break;
     case NI_TK_identifier: {
       res.count += string_arena_append_sv(target, sv_from_cstr("identifier"));
-      StringView id = sv_slice(buffer, token->position_in_file, token->position_in_file + (size_t)token->identifier_length);
-      // fprintf(stderr, "%.*s\n", (int)id.count, id.data);
+      IdentifierReference ref = token->identifier_ref;
+      size_t start = ref & 0x00FFFFFF;
+      size_t length = ref >> 48;
+      StringView id = sv_slice(*(StringView*)identifier_arena, start, start + length);
       res.count += string_arena_printf(target, ": %.*s", (int)id.count, id.data);
       break;
     }
@@ -1153,6 +1340,10 @@ void init_tokenizer_library(void) {
   }
 }
 
+void init_system_info(void) {
+  system_info.memory_page_size_bytes = sysconf(_SC_PAGESIZE);
+};
+
 typedef struct {
   uint64_t i;
   uint32_t j;
@@ -1160,13 +1351,9 @@ typedef struct {
   uint32_t l;
 } WeirdSizeofTest;
 
-void init_system_info(void) {
-  system_info.memory_page_size_bytes = sysconf(_SC_PAGESIZE);
-};
-
 /* Arena tests. In nilang, each module will have "executable" section,
  * which library modules like arenas could use for testing.*/
-MAKE_TYPED_ARENA_DEFINITION(WeirdSizeofTest, WeirdSizeofTestArena, weird_sizeof_test_arena_init, weird_sizeof_test_arena_alloc, weird_sizeof_test_arena_append)
+MAKE_TYPED_ARENA_DEFINITION(WeirdSizeofTest, WeirdSizeofTestArena, weird_sizeof_test_arena_init, weird_sizeof_test_arena_alloc, weird_sizeof_test_arena_append);
 
 void weird_sizeof_arena_test() {
   size_t iteration_count = 100000;
@@ -1265,7 +1452,7 @@ int main(void) {
   fprintf(stderr, "Tokenized. res.token_arena.count: %ld\n", res.token_arena.count);
   StringArena debug_dump_arena = string_arena_init(16*1024*1024, 1024*1024);
   for (size_t i = 0; i < res.token_arena.count; ++i) {
-    StringView elem_debug_sv = ni_token_to_debug_sv(&debug_dump_arena, &res.token_arena.data[i], *(StringView*)&arena);
+    StringView elem_debug_sv = ni_token_to_debug_sv(&res.identifier_arena, *(StringView*)&arena, &debug_dump_arena, &res.token_arena.data[i]);
     fprintf(stderr, "%.*s\n", (int)elem_debug_sv.count, elem_debug_sv.data);
   }
   return 0;
