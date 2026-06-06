@@ -75,6 +75,7 @@ typedef struct {\
 } struct_name;\
 \
 /* TODO: in nilang we would also return an error. */\
+/* TODO: change interface -> reserve_count, capacity, count. */\
 struct_name (init_function_name)(size_t const reserve_count_bytes, size_t const capacity) {\
   fprintf(stderr, "initial arena allocation\n");\
   struct_name res = {0};\
@@ -494,17 +495,17 @@ Note (nilpo):
 This one is a little complicated.
 First of all, we store all identifiers in a string arena. Each unique identifier is stored only once.
 Usually, you would use size_t (== uint64_t on 64-bit systems) to index start of each identifier,
-and uint16_t to store their length. Effectively, IdentifierReference == std::pair(size_t, uint16_t).
+and uint16_t to store their length. Effectively, IdentifierUID == std::pair(size_t, uint16_t).
 Now, notice that we don't actually need full 64 bits to index start.
 On most systems, only 48 bits in pointers are actually used. On very few systems, 57 bits.
 TODO: add source.
 48 bits are enough to index 2^^48 == 256TB of memory. The limit is practically impossible to reach.
-This means, we can use first 16 bits to store the length, meaning IdentifierReference fits into single 64 bit integer:
+This means, we can use first 16 bits to store the length, meaning IdentifierUID fits into single 64 bit integer:
 | length (16 bits) | index of start in arena (48 bits) |.
 This is nice, because now we only need to build a hashmap where value stored is single uint64_t.
 TODO: pack small strings into 48 bits so we don't need to store them in the arena, saving memory.
 */
-typedef uint64_t IdentifierReference;
+typedef uint64_t IdentifierUID;
 
 // TODO: better hash, simd, use the fact that identifiers have restricted character set.
 // TODO: are we sure this hash is never zero?
@@ -517,12 +518,12 @@ uint64_t fnv_hash(StringView const sv) {
   return hash;
 }
 
-bool identifier_ref_equal(const StringArena* const identifier_arena,
-                          IdentifierReference const ref,
+bool identifier_uid_equal(const StringArena* const identifier_arena,
+                          IdentifierUID const ref,
                           StringView const key) {
   /*
   Note (Nilpo):
-  See explanation on what is happening here at IdentifierReference type description.
+  See explanation on what is happening here at IdentifierUID type description.
   */
   if (key.count != (ref >> 48)) {
     return false;
@@ -530,7 +531,7 @@ bool identifier_ref_equal(const StringArena* const identifier_arena,
   return !memcmp(&identifier_arena->data[ref & 0x00FFFFFF], key.data, key.count);
 }
 
-MAKE_TYPED_ARENA_DEFINITION(IdentifierReference, IdentifierHashset, identifier_hashset_init, identifier_hashset_alloc, identifier_hashset_append);
+MAKE_TYPED_ARENA_DEFINITION(IdentifierUID, IdentifierHashset, identifier_hashset_init, identifier_hashset_alloc, identifier_hashset_append);
 
 IdentifierHashset identifier_hashset_init_with_enough_memory_for_reasonably_low_collision_rate(size_t count) {
   // TODO: Round to power of two to optimize modulo?
@@ -547,8 +548,8 @@ _HashmapGetRes identifier_hashset_check(const IdentifierHashset* const hm,
   size_t offset = 0;
   uint64_t hash = fnv_hash(key);
   // fprintf(stderr, "hash: %llu, hm_count: %llu\n", hash, hm->count);
-  uint64_t identifier_ref_under_cursor = hm->data[hash % hm->count];
-  // fprintf(stderr, "identifier_ref_under_cursor: %llu\n", identifier_ref_under_cursor);
+  uint64_t identifier_uid_under_cursor = hm->data[hash % hm->count];
+  // fprintf(stderr, "identifier_uid_under_cursor: %llu\n", identifier_uid_under_cursor);
   /*
   Note (Nilpo):
   We do not have additional array of sentinel "is_slot_occupied" values.
@@ -561,15 +562,15 @@ _HashmapGetRes identifier_hashset_check(const IdentifierHashset* const hm,
   There is invariant that there are enough empty slots so that search stops quickly.
   It is maintained by "insert" function.
   */
-  while (identifier_ref_under_cursor != 0 &&
-         !identifier_ref_equal(identifier_arena, identifier_ref_under_cursor, key)) {
+  while (identifier_uid_under_cursor != 0 &&
+         !identifier_uid_equal(identifier_arena, identifier_uid_under_cursor, key)) {
     ++offset;
-    identifier_ref_under_cursor = hm->data[(hash + offset) % hm->count];
+    identifier_uid_under_cursor = hm->data[(hash + offset) % hm->count];
   }
-  return (_HashmapGetRes){identifier_ref_under_cursor != 0, (hash + offset) % hm->count};
+  return (_HashmapGetRes){identifier_uid_under_cursor != 0, (hash + offset) % hm->count};
 }
 
-void identifier_hashset_insert_unchecked(const IdentifierHashset* const hm, size_t position, IdentifierReference ref) {
+void identifier_hashset_insert_unchecked(const IdentifierHashset* const hm, size_t position, IdentifierUID ref) {
   hm->data[position] = ref;
 }
 
@@ -592,8 +593,6 @@ typedef enum {
   NI_TK_B16,
   NI_TK_B32,
   NI_TK_B64,
-  // TODO: Do we do 128 bit types?
-  // NI_TK_B128,
   // Unsigned integers.
   NI_TK_U8,
   NI_TK_U16,
@@ -680,7 +679,7 @@ typedef enum {
   NI_TK_bitwise_xor,            // aka "^"
   NI_TK_bitwise_or,             // aka "|"
   // - Arithmetic:
-  NI_TK_add,                    // aka "*"
+  NI_TK_add,                    // aka "+"
   NI_TK_saturated_add,          // aka "++"
   NI_TK_saturated_sub,          // aka "--"
   NI_TK_mult,                   // aka "*"
@@ -846,7 +845,7 @@ StringView ni_token_sv[_NI_TK_count];
 
 /*
 // Since each unique identifier is only stored once, we can use this integer as a unique hash for types.
-typedef IdentifierReference TypeUID;
+typedef IdentifierUID TypeUID;
 */
 
 typedef struct {
@@ -855,95 +854,12 @@ typedef struct {
   NiTokenKind kind;
   union {
     uint16_t identifier_length;
-    IdentifierReference identifier_ref;
+    IdentifierUID identifier_uid;
     size_t literal_length;
   };
 } NiToken;
 
 MAKE_TYPED_ARENA_DEFINITION(NiToken, NiTokenArena, ni_token_arena_init, ni_token_arena_alloc, ni_token_arena_append);
-
-#if 0
-static void consume_newline(CTokenizerState* const state, bool prev_was_cr) {
-  ++state->cursor;
-  // Dealing with microslop's and apple's bullshit:
-  // https://en.wikipedia.org/wiki/Newline#Representation
-  if (prev_was_cr && state->cursor < state->buffer.count && state->buffer.data[state->cursor] == '\n') {
-    ++state->cursor;
-  }
-  ++state->current_line;
-  state->beginning_of_current_line = state->cursor;
-  
-  CToken next = generic_token_with_current_state(state, C_TK_newline);
-  // c_token_da_append(&state->result, &next);
-  c_token_arena_append(&state->result, &next);
-
-  return;
-}
-
-static bool try_consuming_newline(CTokenizerState* const state) {
-  const char head = state->buffer.data[state->cursor];
-  if (head == '\n' || head == '\r') {
-    consume_newline(state, head == '\r');
-    return true;
-  }
-  return false;
-}
-#endif
-
-#if 0
-  [NI_TK_bitwise_negate] = "~",
-  [NI_TK_bool_negate] = "!",
-  [NI_TK_plus] = "+",
-  [NI_TK_minus] = "-",
-  [NI_TK_ampersand] = "&",
-  [NI_TK_equal] = "==",
-  [NI_TK_not_equal] = "!=",
-  [NI_TK_less] = "<",
-  [NI_TK_less_equal] = "<=",
-  [NI_TK_greater] = ">",
-  [NI_TK_greater_equal] = ">=",
-  [NI_TK_logic_or] = "||",
-  [NI_TK_logic_and] = "&&",
-  [NI_TK_shift_left] = "<<",
-  [NI_TK_shift_right] = ">>",
-  [NI_TK_most_significant_bit] = ">|",
-  [NI_TK_count_trailing_zeros] = "|<",
-  [NI_TK_bitwise_xor] = "^",
-  [NI_TK_bitwise_or] = "|",
-  [NI_TK_saturated_plus] = "++",
-  [NI_TK_saturated_minus] = "--",
-  [NI_TK_mult] = "*",
-  [NI_TK_saturated_mult] = "**",
-  [NI_TK_div] = "/",
-  [NI_TK_pymod] = "%",
-  // TODO: redo
-  [NI_TK_cmod] = "%%",
-  [NI_TK_assign] = "=",
-  [NI_TK_shift_left_assign] = "<<=",      !!
-  [NI_TK_shift_right_assign] = ">>=",
-  [NI_TK_bitwise_xor_assign] = "^=",
-  [NI_TK_bitwise_or_assign] = "|=",
-  [NI_TK_bitwise_and_assign] = "&=",
-  [NI_TK_plus_assign] = "+=",
-  [NI_TK_saturated_plus_assign] = "++=",
-  [NI_TK_minus_assign] = "-=",
-  [NI_TK_saturated_minus_assign] = "--=", !!
-  [NI_TK_mult_assign] = "*=",
-  [NI_TK_saturated_mult_assign] = "**=",
-  [NI_TK_div_assign] = "/=",
-  [NI_TK_pymod_assign] = "%=",
-  // TODO: redo
-  [NI_TK_cmod_assign] = "%%=",
-  [NI_TK_dot] = ".",
-  [NI_TK_comma] = ",",
-  [NI_TK_semicolon] = ";",
-  [NI_TK_open_parenthesis] = "(",
-  [NI_TK_close_parenthesis] = ")",
-  [NI_TK_open_curly] = "{",
-  [NI_TK_close_curly] = "}",
-  [NI_TK_open_bracket] = "[",
-  [NI_TK_close_bracket] = "]",
-#endif
 
 size_t from_start_length_of_sequence_of_alphanumeric_or_underscore(StringView const buffer) {
   // TODO: simd, shuffle && nibble trick
@@ -967,6 +883,7 @@ typedef enum {
   NI_TK_ERR_base10_literal_base16_lowercase,
   NI_TK_ERR_base10_literal_base16_uppercase,
   NI_TK_ERR_base10_literal_alpha_or_underscore,
+  _NI_TK_ERR_count,
 } NiTokenizationError;
 
 MAKE_TYPED_ARENA_DEFINITION(NiTokenizationError, NiTokenizationErrorArena, ni_tokenization_error_arena_init, ni_tokenization_error_arena_alloc, ni_tokenization_error_arena_append);
@@ -1100,13 +1017,9 @@ typedef struct {
   NiTokenArena token_arena;
   NiTokenizationErrorArena error_arena;
   USizeArena newline_indexes_arena;
-  /* Note (Nilpo):
-  identifier_arena actually stores the strings, identifer_indexes_hashset stores references
-  */
   StringArena identifier_arena;
 } NiTokenizationResult;
 
-// TODO: do identifier storage with hashmap to save memory and make everybody's life easier
 // TODO: store non-semantic tokens (newlines, comments) separately.
 NiTokenizationResult nic_tokenize(StringView const buffer) {
   // TODO: use var := ... in nilang;
@@ -1116,7 +1029,7 @@ NiTokenizationResult nic_tokenize(StringView const buffer) {
   USizeArena newline_indexes_arena = usize_arena_init(buffer.count * sizeof(size_t), buffer.count);
   StringArena identifier_arena = string_arena_init(buffer.count * sizeof(size_t), buffer.count);
   /* Note (Nilpo):
-  This one are for internal needs.
+  This one is for internal needs.
   We first collect the indexes so we can avoid constantly rehashing the identifier hashtable.
   */
   USizeArena identifier_indexes_arena = usize_arena_init(buffer.count * sizeof(size_t), buffer.count);
@@ -1188,6 +1101,9 @@ NiTokenizationResult nic_tokenize(StringView const buffer) {
         memcpy(&next_character, &buffer.data[cursor], 1);
         // TODO: sort, perfect hashing
         switch (next_character) {
+          case ',':
+            next.kind = NI_TK_comma;
+            break;
           case ':':
             next.kind = NI_TK_colon;
             break;
@@ -1214,6 +1130,9 @@ NiTokenizationResult nic_tokenize(StringView const buffer) {
             break;
           case '*':
             next.kind = NI_TK_mult;
+            break;
+          case '/':
+            next.kind = NI_TK_div;
             break;
           case '{':
             next.kind = NI_TK_open_curly;
@@ -1267,30 +1186,25 @@ NiTokenizationResult nic_tokenize(StringView const buffer) {
     }
   }
   
-  // Add each identifier to arena only once and update tokens with "identifier" kind with reference to that arena storage.
+  // Store each identifier in arena only once and update tokens of "identifier" kind with reference to that storage.
   {
-    IdentifierHashset identifier_references_hashset = identifier_hashset_init_with_enough_memory_for_reasonably_low_collision_rate(identifier_indexes_arena.count);
-    size_t index_in_token_arena = 0;
-    NiToken token = {0};
-    StringView key = {0};
-    size_t index_in_arena = 0;
-    IdentifierReference ref = 0;
+    IdentifierHashset identifier_uid_hashset = identifier_hashset_init_with_enough_memory_for_reasonably_low_collision_rate(identifier_indexes_arena.count);
     for (size_t i = 0; i < identifier_indexes_arena.count; ++i) {
-      index_in_token_arena = identifier_indexes_arena.data[i];
-      token = token_arena.data[index_in_token_arena];
-      key = sv_slice(buffer, token.position_in_file, token.position_in_file + (size_t)token.identifier_length);
-      auto _get_res = identifier_hashset_check(&identifier_references_hashset, &identifier_arena, key);
+      size_t index_in_token_arena = identifier_indexes_arena.data[i];
+      NiToken token = token_arena.data[index_in_token_arena];
+      StringView key = sv_slice(buffer, token.position_in_file, token.position_in_file + (size_t)token.identifier_length);
+      auto _get_res = identifier_hashset_check(&identifier_uid_hashset, &identifier_arena, key);
       if (_get_res.was_in_hashmap) {
-        token_arena.data[index_in_token_arena].identifier_ref = identifier_references_hashset.data[_get_res.position];
+        token_arena.data[index_in_token_arena].identifier_uid = identifier_uid_hashset.data[_get_res.position];
 	continue;
       }
-      index_in_arena = identifier_arena.count;
+      size_t index_in_arena = identifier_arena.count;
       // fprintf(stderr, "inserting %.*s, length: %ld, index_in_arena: %ld\n", (int)key.count, key.data, (uint64_t)token.identifier_length, index_in_arena);
       string_arena_append_sv(&identifier_arena, key);
-      ref = (((uint64_t)token.identifier_length) << 48) | index_in_arena;
-      // fprintf(stderr, "ref, extracted - length: %ld, start: %ld\n", ref >> 48, ref & 0x00FFFFFF);
-      identifier_hashset_insert_unchecked(&identifier_references_hashset, _get_res.position, ref);
-      token_arena.data[index_in_token_arena].identifier_ref = ref;
+      IdentifierUID identifier_uid = (((uint64_t)token.identifier_length) << 48) | index_in_arena;
+      // fprintf(stderr, "identifier_uid, extracted - length: %ld, start: %ld\n", ref >> 48, ref & 0x00FFFFFF);
+      identifier_hashset_insert_unchecked(&identifier_uid_hashset, _get_res.position, identifier_uid);
+      token_arena.data[index_in_token_arena].identifier_uid = identifier_uid;
     }
   }
 
@@ -1314,9 +1228,9 @@ static StringView ni_token_to_debug_sv(const StringArena* const identifier_arena
       break;
     case NI_TK_identifier: {
       res.count += string_arena_append_sv(target, sv_from_cstr("identifier"));
-      IdentifierReference ref = token->identifier_ref;
-      size_t start = ref & 0x00FFFFFF;
-      size_t length = ref >> 48;
+      IdentifierUID identifier_uid = token->identifier_uid;
+      size_t start = identifier_uid & 0x00FFFFFF;
+      size_t length = identifier_uid >> 48;
       StringView id = sv_slice(*(StringView*)identifier_arena, start, start + length);
       res.count += string_arena_printf(target, ": %.*s", (int)id.count, id.data);
       break;
@@ -1334,9 +1248,567 @@ static StringView ni_token_to_debug_sv(const StringArena* const identifier_arena
   return res;
 }
 
+typedef enum {
+  _NI_SYM_zero_stub,
+  NI_SYM_type,
+  NI_SYM_procedure,
+  NI_SYM_global_variable,
+  // TODO: meta-versions of the same things.
+  _NI_SYM_count,
+} NiSymbolKind;
+
+/*
+Note (Nilpo):
+| 8 bits - kind | 56 bits - index in respective table |.
+*/
+typedef uint64_t NiSymbolUID;
+
+typedef enum {
+  _NI_AT_zero_stub,
+  NI_AT_numeric_constant,
+  NI_AT_variable,
+  /*
+  Note (Nilpo):
+  Whilst cast can be treated as unary operator, it is more convenient to consider it a separate kind,
+  so we can store identifier_uid the same way as for variable or function.
+  */
+  NI_AT_cast,
+  NI_AT_unary_operator,
+  NI_AT_binary_operator,
+  NI_AT_ternary_operator,
+  NI_AT_procedure_call,
+  NI_AT_expression_end,
+  NI_AT_declarator,
+  NI_AT_assign,
+  NI_AT_statement,
+  NI_AT_statement_end,
+  NI_AT_block, // aka "compound statement"/"scope"/multiple statements enclosed in {...}
+  NI_AT_statement_if,
+  _NI_AT_count,
+} NiAtomKind;
+
+/*
+Note (Nilpo):
+TODO: yeah
+We have following precedence levels:
+- Default. This is when we start parsing from blank slate.
+- Logical or.
+- Logical and. It has higher precedence than or so the "a || b && c" parse as "a || (b && c)", which is intuitive.
+*/
+typedef enum {
+  NI_PREC_default,
+  NI_PREC_add_sub,      // +, -
+  NI_PREC_mult_div_mod, // *, /, %
+  NI_PREC_unary,
+  _NI_PREC_count,
+} NiOperatorPrecedence;
+
+typedef enum {
+  _NI_UnOp_zero_stub,
+  NI_UnOp_bitwise_negate,
+  NI_UnOp_bool_negate,
+  NI_UnOp_negate,
+  NI_UnOp_addressof,
+  _NI_UnOp_count,
+} NiUnaryOperatorKind;
+
+typedef enum {
+  _NI_BinOp_zero_stub,
+  NI_BinOp_add,
+  NI_BinOp_sub,
+  NI_BinOp_mult,
+  NI_BinOp_div,
+  _NI_BinOp_count,
+} NiBinaryOperatorKind;
+
+typedef enum {
+  _NI_TernOp_zero_stub,
+  _NI_TernOp_count,
+} NiTernaryOperatorKind;
+
+NiOperatorPrecedence ni_binop_precedence[_NI_BinOp_count] = {
+  [NI_BinOp_add] = NI_PREC_add_sub,
+  [NI_BinOp_sub] = NI_PREC_add_sub,
+  [NI_BinOp_mult] = NI_PREC_mult_div_mod,
+  [NI_BinOp_div] = NI_PREC_mult_div_mod,
+};
+
+const char* ni_unop_cstr[_NI_UnOp_count] = {
+  [NI_UnOp_bitwise_negate] = "~",
+  [NI_UnOp_bool_negate] = "!",
+  [NI_UnOp_negate] = "un-",
+  [NI_UnOp_addressof] = "&",
+};
+
+StringView ni_unop_sv[_NI_BinOp_count] = {0};
+
+const char* ni_binop_cstr[_NI_BinOp_count] = {
+  [NI_BinOp_add] = "+",
+  [NI_BinOp_sub] = "-",
+  [NI_BinOp_mult] = "*",
+  [NI_BinOp_div] = "/",
+};
+
+StringView ni_binop_sv[_NI_BinOp_count] = {0};
+
+typedef struct {
+  // TODO: struct of arrays
+  size_t position_in_file;
+  NiAtomKind kind;
+  /*
+  Note (Nilpo):
+  We do not store ammount of arguments for procedure call, since we check correctness immediately during parsing.
+  */
+  union {
+    NiUnaryOperatorKind   unary_op_kind;
+    NiBinaryOperatorKind  binary_op_kind;
+    NiTernaryOperatorKind ternary_op_kind;
+    IdentifierUID         identifier_uid;   // for casts, procedures, variables, and declarators
+    size_t                expression_count; // for assign.
+    size_t                statement_count;  // for blocks, if/elif/else, cases.
+    size_t                case_count;       // for switch (if var == {case; ...}), perfect_hash.
+    size_t                literal_length;   // TODO: better way to handle?
+  };
+} NiAtom;
+
+/*
+Note (Nilpo):
+Unlike most compilers, we do not have an AST (abstract syntax tree).
+The reason is, trees are non-linear in memory and bad for cache effects, and also hard to deal with.
+Instead, we have a linear "NiAtomArena", where everything is stored in reverse polish notation.
+Examples:
+a := U64.69;           => |a|69|cast(U64)|:=|
+a = b + c + 1;         => |a|b |c        |+ |1   |+|=|
+d = func(1, a, 3) + 1; => |d|1 |a        |3 |func|1|+|=|
+Simple conditionals:
+if a && b || c { d; } else { e; f; } => |a|b|&&|c|"||"|if - 1 statement|d|else - 2 statements|e|f|
+if cond { a; } else if cond2 { b; c; } else { d; } => |cond|if - 1|a|cond2|elif - 2|b|c|else - 1|d|
+This might seem a little counter-intutitive, but it makes type-checking quite easy.
+*/
+MAKE_TYPED_ARENA_DEFINITION(NiAtom, NiAtomArena, ni_atom_arena_init, ni_atom_arena_alloc, ni_atom_arena_append);
+
+typedef enum {
+  _NI_AT_ERR_zero_stub,
+  NI_AT_ERR_unclosed_rounded,
+  NI_AT_ERR_empty_expression,
+  NI_AT_ERR_incomplete_expression,
+  NI_AT_ERR_forgot_semicolon,
+  NI_AT_ERR_c_style_assign_usage,
+  NI_AT_ERR_c_style_comma_usage,
+  _NI_AT_ERR_count,
+} NiParsingErrorKind;
+
+// GOD THANK YOU DENIS RITCHIE AND BRIAN KERNIGAN FOR A WONDERFUL LANGUAGE WITHOUT MULTIPLE RETURN VALUES
+// AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+// AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+// AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+typedef struct {
+  size_t first_index_after_expression;
+  NiParsingErrorKind error_kind;
+} _ExprParseRes;
+
+_ExprParseRes parse_expression_into_atom_arena(NiAtomArena* const atom_arena,
+                                               const NiTokenArena* const token_arena,
+                                               size_t cursor,
+					       NiOperatorPrecedence passed_precedence);
+
+_ExprParseRes parse_subexpression_into_atom_arena(NiAtomArena* const atom_arena,
+                                                  const NiTokenArena* const token_arena,
+                                                  size_t cursor) {
+  size_t new_cursor = cursor;
+  NiToken under_cursor = token_arena->data[cursor];
+  NiAtom next = {.position_in_file=under_cursor.position_in_file};
+  // TODO: do an outer switch?
+  // Handling constants.
+  {
+    switch (under_cursor.kind) {
+      case NI_TK_base2_literal:
+        [[fallthrough]];
+      case NI_TK_base8_literal:
+        [[fallthrough]];
+      case NI_TK_base10_literal:
+        [[fallthrough]];
+      case NI_TK_base16_literal:
+        next.kind = NI_AT_numeric_constant;
+        break;
+      default:
+        next.kind = _NI_AT_zero_stub;
+        break;
+    }
+    if (next.kind != _NI_AT_zero_stub) {
+      next.literal_length = under_cursor.literal_length;
+      ni_atom_arena_append(atom_arena, &next);
+      new_cursor += 1;
+      return (_ExprParseRes){new_cursor, _NI_AT_ERR_zero_stub};
+    }
+  }
+
+  // Handling unary operators.
+  {
+    switch (under_cursor.kind) {
+      case NI_TK_bitwise_negate:
+        next.unary_op_kind = NI_UnOp_bitwise_negate;
+        break;
+      case NI_TK_bool_negate:
+        next.unary_op_kind = NI_UnOp_bool_negate;
+        break;
+      case NI_TK_minus:
+        next.unary_op_kind = NI_UnOp_negate;
+        break;
+      case NI_TK_ampersand:
+        next.unary_op_kind = NI_UnOp_addressof;
+        break;
+      default:
+        next.unary_op_kind = _NI_UnOp_zero_stub;
+        break;
+    }
+    if (next.unary_op_kind != _NI_UnOp_zero_stub) {
+      next.kind = NI_AT_unary_operator;
+      new_cursor += 1;
+      auto _res = parse_expression_into_atom_arena(atom_arena, token_arena, new_cursor, NI_PREC_unary);
+      new_cursor = _res.first_index_after_expression;
+      if (_res.error_kind != _NI_AT_ERR_zero_stub) {
+	return (_ExprParseRes){new_cursor, _res.error_kind};
+      }
+      ni_atom_arena_append(atom_arena, &next);
+      return (_ExprParseRes){new_cursor, _NI_AT_ERR_zero_stub};
+    }
+  }
+
+  // Handling identifiers (type casts, variables, procedures).
+  {
+    if (under_cursor.kind == NI_TK_identifier) {
+      // TODO: right now we assume all identifiers to be variable names
+      next.kind = NI_AT_variable;
+      next.identifier_uid = under_cursor.identifier_uid;
+      ni_atom_arena_append(atom_arena, &next);
+      new_cursor += 1;
+      return (_ExprParseRes){new_cursor, _NI_AT_ERR_zero_stub};
+    }
+  }
+
+  // Handling rounded parenthesis.
+  {
+    if (under_cursor.kind == NI_TK_open_rounded) {
+      new_cursor += 1;
+      auto _res = parse_expression_into_atom_arena(atom_arena, token_arena, new_cursor, NI_PREC_default);
+      new_cursor = _res.first_index_after_expression;
+      if (_res.error_kind != _NI_AT_ERR_zero_stub) {
+	return (_ExprParseRes){new_cursor, _res.error_kind};
+      }
+      if (token_arena->data[new_cursor].kind != NI_TK_close_rounded) {
+        return (_ExprParseRes){new_cursor, NI_AT_ERR_unclosed_rounded};
+      }
+      new_cursor += 1;
+      return (_ExprParseRes){new_cursor, _NI_AT_ERR_zero_stub};
+    }
+  }
+
+  return (_ExprParseRes){new_cursor, NI_AT_ERR_empty_expression};
+}
+
+/*
+Note (Nilpo):
+The idea for this function is that it returns when encountering something which is not a subexpression or operator.
+It also stops when we encounter binary operator with precedence lower than passed.
+Thus, if we pass the lowest precedence available, we will parse the whole expression.
+Note (Nilpo):
+However, this does not apply to commas. They are handled in special manner.
+A little bit of a tough thing is multiple value assignment and commas.
+There is a lot of weird stuff people may write, and we somehow have to adequately report errors in all of them:
+Examples:
+- Comma is only for regular lvalue assignment returned from functions:
+a: _, b = func_returning_two_values(args);
+Not for this:
+a, b = b, a;
+And also not for this:
+a, b += func_returning_two_values(args);
+There is also a possibility of assignment in the middle of the expression:
+a = b = c;
+It gets especially hairy with commas:
+a = b, c = d; <- valid C!
+So, here's what we do:
+*/
+_ExprParseRes parse_expression_into_atom_arena(NiAtomArena* const atom_arena,
+                                               const NiTokenArena* const token_arena,
+                                               size_t cursor,
+					                                     NiOperatorPrecedence passed_precedence) {
+  size_t new_cursor = cursor;
+  auto _res = parse_subexpression_into_atom_arena(atom_arena, token_arena, new_cursor);
+  new_cursor = _res.first_index_after_expression;
+  if (_res.error_kind != _NI_AT_ERR_zero_stub) {
+    NiParsingErrorKind error_kind = cursor != new_cursor ? NI_AT_ERR_incomplete_expression : NI_AT_ERR_empty_expression;
+    return (_ExprParseRes){new_cursor, error_kind};
+  }
+
+  NiToken under_cursor = {0};
+  NiAtom next = {0};
+  while (true) {
+    under_cursor = token_arena->data[new_cursor];
+    next = (NiAtom){.position_in_file=under_cursor.position_in_file};
+
+    switch (under_cursor.kind) {
+      case NI_TK_add:
+        next.binary_op_kind = NI_BinOp_add;
+        break;
+      case NI_TK_minus:
+        next.binary_op_kind = NI_BinOp_sub;
+        break;
+      case NI_TK_mult:
+        next.binary_op_kind = NI_BinOp_mult;
+        break;
+      case NI_TK_div:
+        next.binary_op_kind = NI_BinOp_div;
+        break;
+      default:
+        next.binary_op_kind = _NI_BinOp_zero_stub;
+        break;
+    }
+
+    if (next.binary_op_kind == _NI_BinOp_zero_stub) {
+      // Our job here is done. The thing under cursor is not a binary operator.
+      return (_ExprParseRes){new_cursor, _NI_AT_ERR_zero_stub};
+    }
+
+    next.kind = NI_AT_binary_operator;
+    NiOperatorPrecedence cursor_precedence = ni_binop_precedence[next.binary_op_kind];
+
+    // Here's the part where operator precedence and associativity are handled.
+    // TODO: operator <=> in nilang
+    // Note (Nilpo): If we do strict greater here, the operator will be right associative.
+    if (passed_precedence >= cursor_precedence) {
+      return (_ExprParseRes){new_cursor, _NI_AT_ERR_zero_stub};
+    }
+
+    new_cursor += 1;
+    // TODO: hazardous precedence
+    if (passed_precedence == cursor_precedence) {
+    }
+    /* if (passed_precedence < cursor_precedence) */ {
+      auto _res = parse_expression_into_atom_arena(atom_arena, token_arena, new_cursor, cursor_precedence);
+      new_cursor = _res.first_index_after_expression;
+      if (_res.error_kind != _NI_AT_ERR_zero_stub) {
+        return (_ExprParseRes){new_cursor, _res.error_kind};
+      }
+      ni_atom_arena_append(atom_arena, &next);
+      continue;
+    }
+  }
+}
+
+_ExprParseRes parse_assign_or_expression_statement_into_atom_arena(
+  NiAtomArena* const atom_arena,
+  const NiTokenArena* const token_arena,
+  size_t cursor)
+{
+  size_t prev_cursor = cursor;
+  size_t new_cursor = cursor;
+  NiToken under_cursor = token_arena->data[new_cursor];
+  NiAtom next = (NiAtom){.position_in_file=under_cursor.position_in_file};
+
+  size_t lhs_expressions_count = 0;
+  // Parse left hand side of statement. This loop will only continue if we expect to actually get the expression.
+  while (true) {
+    // TODO: add two eof tokens to token arena.
+    // If declarator is under cursor, parse it.
+    if (token_arena->data[new_cursor].kind == NI_TK_identifier &&
+        token_arena->data[new_cursor + 1].kind == NI_TK_colon) {
+      under_cursor = token_arena->data[new_cursor];
+
+      next.position_in_file = under_cursor.position_in_file;
+      next.kind = NI_AT_declarator;
+      next.identifier_uid = under_cursor.identifier_uid;
+      ni_atom_arena_append(atom_arena, &next);
+      // TODO: append type uid
+      // TODO: if qualifiers are applied to type, issue an error.
+      // TODO: actually parse the type lol
+      new_cursor += 2;
+      if (token_arena->data[new_cursor].kind != NI_TK_comma) {
+        break;
+      }
+      // Skip comma and continue the grind.
+      new_cursor += 1;
+      prev_cursor = new_cursor;
+      continue;
+    }
+    auto _res = parse_expression_into_atom_arena(atom_arena, token_arena, prev_cursor, NI_PREC_default);
+    new_cursor = _res.first_index_after_expression;
+    if (_res.error_kind != _NI_AT_ERR_zero_stub) {
+      return (_ExprParseRes){new_cursor, _res.error_kind};
+    }
+
+    under_cursor = token_arena->data[new_cursor];
+    lhs_expressions_count += 1;
+    next = (NiAtom){.position_in_file=under_cursor.position_in_file, .kind=NI_AT_expression_end};
+    ni_atom_arena_append(atom_arena, &next);
+
+    if (under_cursor.kind != NI_TK_comma) {
+      break;
+    }
+    // Skip comma and continue the grind.
+    new_cursor += 1;
+    prev_cursor = new_cursor;
+  }
+  
+  under_cursor = token_arena->data[new_cursor];
+  switch (under_cursor.kind) {
+    case NI_TK_assign:
+      // TODO: do kind properly for all assigns.
+      next = (NiAtom){.position_in_file=under_cursor.position_in_file, .kind=NI_AT_assign};
+      ni_atom_arena_append(atom_arena, &next);
+
+      // Skip assign operator.
+      new_cursor += 1;
+      prev_cursor = new_cursor;
+
+      // Parse right hand side.
+      auto _res = parse_expression_into_atom_arena(atom_arena, token_arena, prev_cursor, NI_PREC_default);
+      new_cursor = _res.first_index_after_expression;
+      if (_res.error_kind != _NI_AT_ERR_zero_stub) {
+        return (_ExprParseRes){new_cursor, _res.error_kind};
+      }
+
+      under_cursor = token_arena->data[new_cursor];
+      switch (under_cursor.kind) {
+        case NI_TK_assign:
+          return (_ExprParseRes){new_cursor, NI_AT_ERR_c_style_assign_usage};
+        case NI_TK_comma:
+          return (_ExprParseRes){new_cursor, NI_AT_ERR_c_style_comma_usage};
+        case NI_TK_semicolon:
+          new_cursor += 1;
+          break;
+        default:
+          // TODO: user forgot semicolon
+          break;
+      }
+      break;
+    case NI_TK_semicolon:
+      // Our job here is done. The statement was actually an expression statement.
+      // Consume semicolon.
+      new_cursor += 1;
+      break;
+    default:
+      // The statement was actually an expression statement, the user just forgot the semicolon.
+
+      // TODO: error
+      // next = (NiAtom){.position_in_file=under_cursor.position_in_file, .kind=NI_AT_ERR_forgot_semicolon};
+      // ni_atom_arena_append(atom_arena, &next);
+      break;
+  }
+  next.position_in_file=under_cursor.position_in_file;
+  next.kind = NI_AT_statement_end;
+  ni_atom_arena_append(atom_arena, &next);
+  return (_ExprParseRes){new_cursor, _NI_AT_ERR_zero_stub};
+}
+
+_ExprParseRes parse_statement_into_atom_arena(NiAtomArena* const atom_arena,
+                                              const NiTokenArena* const token_arena,
+                                              size_t cursor) {
+  size_t prev_cursor = cursor;
+  size_t new_cursor = cursor;
+  NiToken under_cursor = token_arena->data[new_cursor];
+  NiAtom next = (NiAtom){.position_in_file=under_cursor.position_in_file};
+  switch (under_cursor.kind) {
+    // Parse assign (including declaration) or expression statement.
+    default:
+      return parse_assign_or_expression_statement_into_atom_arena(atom_arena, token_arena, cursor);
+      break;
+  }
+}
+
+typedef struct {
+  NiAtomArena atom_arena;
+  // NiTokenizationErrorArena error_arena;
+} NiParsingResult;
+
+NiParsingResult nic_parse(const NiTokenArena* const token_arena) {
+  // TODO: better heuristics for sizes of arenas
+  NiAtomArena atom_arena = ni_atom_arena_init(token_arena->count*sizeof(NiAtom), token_arena->count);
+
+  size_t cursor = 0;
+  _ExprParseRes _res = {0};
+  while (true) {
+    _res = parse_statement_into_atom_arena(&atom_arena, token_arena, cursor);
+    if (_res.error_kind != _NI_AT_ERR_zero_stub) {
+      fprintf(stderr, "Error encountered: %d\n", _res.error_kind);
+      break;
+    }
+    cursor = _res.first_index_after_expression;
+  }
+
+  return (NiParsingResult){atom_arena};
+}
+
+static StringView ni_atom_to_debug_sv(const StringArena* const identifier_arena,
+                                      StringView const buffer,
+                                      StringArena* const target,
+				      const NiAtom* const atom) {
+  StringView res = {0};
+  // TODO: in nilang, we will have switches on ranges
+  switch (atom->kind) {
+    case _NI_AT_zero_stub:
+      res.count += string_arena_append_sv(target, sv_from_cstr("zero_stub"));
+      break;
+    case NI_AT_variable: {
+      // res.count += string_arena_append_sv(target, sv_from_cstr("variable"));
+      IdentifierUID identifier_uid = atom->identifier_uid;
+      size_t start = identifier_uid & 0x0000FFFFFFFFFFFF;
+      size_t length = identifier_uid >> 48;
+      StringView id = sv_slice(*(StringView*)identifier_arena, start, start + length);
+      res.count += string_arena_printf(target, "%.*s", (int)id.count, id.data);
+      break;
+    }
+    case NI_AT_numeric_constant: {
+      // res.count += string_arena_append_sv(target, sv_from_cstr("numeric_constant"));
+      StringView id = sv_slice(buffer, atom->position_in_file, atom->position_in_file + (size_t)atom->literal_length);
+      res.count += string_arena_printf(target, "%.*s", (int)id.count, id.data);
+      break;
+    }
+    case NI_AT_unary_operator: {
+      res.count += string_arena_append_sv(target, ni_unop_sv[atom->unary_op_kind]);
+      break;
+    }
+    case NI_AT_binary_operator: {
+      res.count += string_arena_append_sv(target, ni_binop_sv[atom->binary_op_kind]);
+      break;
+    }
+    case NI_AT_expression_end: {
+      res.count += string_arena_append_sv(target, sv_from_cstr("expr_end"));
+      break;
+    }
+    case NI_AT_statement_end: {
+      res.count += string_arena_append_sv(target, sv_from_cstr("stmt_end\n"));
+      break;
+    }
+    case NI_AT_declarator: {
+      IdentifierUID identifier_uid = atom->identifier_uid;
+      size_t start = identifier_uid & 0x0000FFFFFFFFFFFF;
+      size_t length = identifier_uid >> 48;
+      StringView id = sv_slice(*(StringView*)identifier_arena, start, start + length);
+      res.count += string_arena_printf(target, "%.*s:_", (int)id.count, id.data);
+      break;
+    }
+    case NI_AT_assign: {
+      res.count += string_arena_append_sv(target, sv_from_cstr("="));
+      break;
+    }
+    default:
+      res.count += string_arena_append_sv(target, sv_from_cstr("TODO"));
+      break;
+  }
+  res.data = target->data + target->count - res.count;
+  return res;
+}
+
 void init_tokenizer_library(void) {
-  for (NiTokenKind tk_index = _NI_TK_stringifiable_start; tk_index < _NI_TK_stringifiable_end; ++tk_index) {
+  for (NiTokenKind tk_index = _NI_TK_stringifiable_start; tk_index < _NI_TK_stringifiable_end; tk_index += 1) {
     ni_token_sv[tk_index] = sv_from_cstr(ni_token_cstr[tk_index]);
+  }
+  for (NiUnaryOperatorKind unop_index = _NI_UnOp_zero_stub + 1; unop_index < _NI_UnOp_count; unop_index += 1) {
+    ni_unop_sv[unop_index] = sv_from_cstr(ni_unop_cstr[unop_index]);
+  }
+  for (NiBinaryOperatorKind binop_index = _NI_BinOp_zero_stub + 1; binop_index < _NI_BinOp_count; binop_index += 1) {
+    ni_binop_sv[binop_index] = sv_from_cstr(ni_binop_cstr[binop_index]);
   }
 }
 
@@ -1419,7 +1891,7 @@ int main(void) {
   weird_sizeof_arena_test();
   odd_sizeof_arena_test();
   }
-  auto open_res = open_file("tests/some_arithmetic_operators.ni", O_RDONLY);
+  auto open_res = open_file("tests/expressions_and_precedence.ni", O_RDONLY);
   if (open_res.status != OpenOpStatus_success) {
     // TODO: string representations of all errors.
     fprintf(stdout, "Something went wrong while trying to open file.\n");
@@ -1455,5 +1927,12 @@ int main(void) {
     StringView elem_debug_sv = ni_token_to_debug_sv(&res.identifier_arena, *(StringView*)&arena, &debug_dump_arena, &res.token_arena.data[i]);
     fprintf(stderr, "%.*s\n", (int)elem_debug_sv.count, elem_debug_sv.data);
   }
+
+  NiParsingResult parse_res = nic_parse(&res.token_arena);
+  for (size_t i = 0; i < parse_res.atom_arena.count; ++i) {
+    StringView elem_debug_sv = ni_atom_to_debug_sv(&res.identifier_arena, *(StringView*)&arena, &debug_dump_arena, &parse_res.atom_arena.data[i]);
+    fprintf(stderr, "%.*s ", (int)elem_debug_sv.count, elem_debug_sv.data);
+  }
+  fprintf(stderr, "\n");
   return 0;
 }
