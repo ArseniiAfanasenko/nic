@@ -1,6 +1,7 @@
 **/*.o
 /test_hashmap
 /preprocessor
+/nic
 /*.out
 /string_to_int
 /compress_identifier

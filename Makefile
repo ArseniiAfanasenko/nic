@@ -6,8 +6,8 @@ CFLAGS+=-std=c23 -static -lc -Wall -Wextra -Wno-unused-parameter -Wno-unused-fun
 hashmap.o: hashmap.h hashmap.c
 	$(CC) $(CFLAGS) -c hashmap.c -o $@ $(LDFLAGS)
 
-preprocessor: preprocessor.c
-	$(CC) $(CFLAGS) preprocessor.c -o $@ $(LDFLAGS)
+nic: nic.c
+	$(CC) $(CFLAGS) nic.c -o $@ $(LDFLAGS)
 
 .PHONY=clean
 clean: rm -f preprocessor
