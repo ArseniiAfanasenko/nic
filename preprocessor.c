@@ -77,21 +77,21 @@ typedef struct {\
 /* TODO: in nilang we would also return an error. */\
 /* TODO: change interface -> reserve_count, capacity, count. */\
 struct_name (init_function_name)(size_t const reserve_count_bytes, size_t const capacity) {\
-  fprintf(stderr, "initial arena allocation\n");\
+  /*fprintf(stderr, "initial arena allocation\n");*/\
   struct_name res = {0};\
   /*This is a way to round value to nearest multiple of page size, using the fact that page size is multiple of 2.*/\
   /*Ideally, we will have something like invariants and be able to optimize based on that.*/\
   size_t rounded_reserve_count_bytes = (reserve_count_bytes + system_info.memory_page_size_bytes - 1) & ~(system_info.memory_page_size_bytes - 1);\
-  fprintf(stderr, "rounded_reserve_count_bytes: %ld\n", rounded_reserve_count_bytes);\
+  /* fprintf(stderr, "rounded_reserve_count_bytes: %ld\n", rounded_reserve_count_bytes); */\
   res.reserve_count_bytes = rounded_reserve_count_bytes;\
   /* Note: it is important that result of mmap is page-aligned and zeroed. */\
   Byte* virtual_alloc_ptr = mmap(NULL, rounded_reserve_count_bytes, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);\
   size_t initial_capacity_bytes = (capacity * sizeof(T) + system_info.memory_page_size_bytes - 1) & ~(system_info.memory_page_size_bytes - 1);\
-  fprintf(stderr, "initial_capacity_bytes: %ld\n", initial_capacity_bytes);\
+  /* fprintf(stderr, "initial_capacity_bytes: %ld\n", initial_capacity_bytes); */\
   /* Size value of mprotect needs to be a multiple of page size. */\
   mprotect(virtual_alloc_ptr, initial_capacity_bytes, PROT_READ | PROT_WRITE);\
   res.data = (T*)virtual_alloc_ptr;\
-  fprintf(stderr, "initial_capacity: %ld\n", initial_capacity_bytes / sizeof(T));\
+  /* fprintf(stderr, "initial_capacity: %ld\n", initial_capacity_bytes / sizeof(T)); */\
   res.capacity = initial_capacity_bytes / sizeof(T);\
   res.count = 0;\
   return res;\
@@ -101,15 +101,15 @@ struct_name (init_function_name)(size_t const reserve_count_bytes, size_t const 
 T* (alloc_function_name)(struct_name* const target, size_t const count) {\
   size_t new_count = target->count + count;\
   if (new_count >= target->capacity) /* TODO: unlikely */ {\
-    fprintf(stderr, "arena expansion\n");\
+    /* fprintf(stderr, "arena expansion\n"); */\
     /* TODO: expanding by factor of 2 is matematically suboptimal. */\
     size_t new_capacity_bytes = MAX((target->capacity * sizeof(T)) * 2, new_count * sizeof(T));\
     new_capacity_bytes = (new_capacity_bytes + system_info.memory_page_size_bytes - 1) & ~(system_info.memory_page_size_bytes - 1);\
-    fprintf(stderr, "new_capacity_bytes: %ld\n", new_capacity_bytes);\
+    /* fprintf(stderr, "new_capacity_bytes: %ld\n", new_capacity_bytes); */\
     /* TODO: check if new_capacity_bytes is more than reserve, return OUT OF MEMORY error. */\
     mprotect((char*)target->data, new_capacity_bytes, PROT_READ | PROT_WRITE);\
     target->capacity = new_capacity_bytes / sizeof(T);\
-    fprintf(stderr, "new_capacity: %ld\n", target->capacity);\
+    /* fprintf(stderr, "new_capacity: %ld\n", target->capacity); */\
   };\
   target->count = new_count;\
   return target->data + target->count - count;\
@@ -445,10 +445,11 @@ typedef struct {
 MAKE_TYPED_ARENA_DEFINITION(U64ToU64HashmapEntry, U64ToU64Hashmap, u64_to_u64_hashmap_init, u64_to_u64_hashmap_alloc, u64_to_u64_hashmap_append);
 
 // Bool is for whether entry with the same key was already in the hashmap.
+// TODO: less horrible name
 bool u64_to_u64_hashmap_insert_unchecked(U64ToU64Hashmap* const hm, U64ToU64HashmapEntry entry) {
-  size_t offset = 0;
   uint64_t key = entry.key;
-  uint64_t element_under_cursor = hm->data[key % hm->count].key;
+  uint64_t cursor = key;
+  uint64_t element_under_cursor = hm->data[cursor % hm->count].key;
   /*
   Note (Nilpo):
   We do not have additional array of sentinel "is_slot_occupied" values.
@@ -458,11 +459,31 @@ bool u64_to_u64_hashmap_insert_unchecked(U64ToU64Hashmap* const hm, U64ToU64Hash
   // TODO: robin hood hashing.
   // TODO: simd.
   while (element_under_cursor != 0 && element_under_cursor != key) {
-    ++offset;
-    element_under_cursor = hm->data[(key + offset) % hm->count].key;
+    cursor += 1;
+    element_under_cursor = hm->data[cursor % hm->count].key;
   }
-  hm->data[(key + offset) % hm->count].value = entry.value;
+  hm->data[cursor % hm->count].key   = entry.key;
+  hm->data[cursor % hm->count].value = entry.value;
   return element_under_cursor == key;
+}
+
+void u64_to_u64_hashmap_insert_assume_no_such_key(U64ToU64Hashmap* hm, U64ToU64HashmapEntry entry) {
+  uint64_t cursor = entry.key;
+  uint64_t element_under_cursor = hm->data[cursor % hm->count].key;
+  /*
+  Note (Nilpo):
+  We do not have additional array of sentinel "is_slot_occupied" values.
+  The idea is, if key in slot is equal to zero, then slot is empty.
+  This works because we usually store enums or indexes, and we have "zero_stub" in pretty much all enums.
+  */
+  // TODO: robin hood hashing.
+  // TODO: simd.
+  while (element_under_cursor != 0) {
+    cursor += 1;
+    element_under_cursor = hm->data[cursor % hm->count].key;
+  }
+  hm->data[cursor % hm->count].key   = entry.key;
+  hm->data[cursor % hm->count].value = entry.value;
 }
 
 typedef struct {
@@ -471,8 +492,8 @@ typedef struct {
 } _HashmapGetRes;
 
 _HashmapGetRes u64_to_u64_hashmap_get(const U64ToU64Hashmap* const hm, uint64_t key) {
-  size_t offset = 0;
-  uint64_t element_under_cursor = hm->data[key % hm->count].key;
+  uint64_t cursor = key;
+  uint64_t element_under_cursor = hm->data[cursor % hm->count].key;
   /*
   Note (Nilpo):
   We do not have additional array of sentinel "is_slot_occupied" values.
@@ -484,10 +505,10 @@ _HashmapGetRes u64_to_u64_hashmap_get(const U64ToU64Hashmap* const hm, uint64_t 
   It is maintained by "insert" function.
   */
   while (element_under_cursor != 0 && element_under_cursor != key) {
-    ++offset;
-    element_under_cursor = hm->data[(key + offset) % hm->count].key;
+    cursor += 1;
+    element_under_cursor = hm->data[cursor % hm->count].key;
   }
-  return (_HashmapGetRes){element_under_cursor == key, (key + offset) % hm->count};
+  return (_HashmapGetRes){element_under_cursor == key, cursor % hm->count};
 }
 
 /*
@@ -504,6 +525,7 @@ This means, we can use first 16 bits to store the length, meaning IdentifierUID 
 | length (16 bits) | index of start in arena (48 bits) |.
 This is nice, because now we only need to build a hashmap where value stored is single uint64_t.
 TODO: pack small strings into 48 bits so we don't need to store them in the arena, saving memory.
+TODO: it is done, make a writeup
 */
 typedef uint64_t IdentifierUID;
 
@@ -544,7 +566,7 @@ IdentifierHashset identifier_hashset_init_with_enough_memory_for_reasonably_low_
 
 _HashmapGetRes identifier_hashset_check(const IdentifierHashset* const hm,
                                         const StringArena* const identifier_arena,
-			                StringView const key) {
+			                                  StringView const key) {
   size_t offset = 0;
   uint64_t hash = fnv_hash(key);
   // fprintf(stderr, "hash: %llu, hm_count: %llu\n", hash, hm->count);
@@ -576,48 +598,15 @@ void identifier_hashset_insert_unchecked(const IdentifierHashset* const hm, size
 
 typedef enum {
   _NI_TK_zero_stub,
-  // TODO: just bool, Bool8 looks stupid.
-  NI_TK_Bool8,
-  _NI_TK_stringifiable_start = NI_TK_Bool8,
-  // TODO: reorder stuff here so that when we do perfect hashing we don't need a lookup table.
-  /* TYPES: */
-  NI_TK_Byte,
-  // Distinct integers, neither arithmetic nor bit operations are allowed on them.
-  // Useful for e.g. linux file descriptors.
-  NI_TK_D8,
-  NI_TK_D16,
-  NI_TK_D32,
-  NI_TK_D64,
-  // Bit integers, arithmetic is not allowed on them, only bitwise operations and shifts.
-  NI_TK_B8,
-  NI_TK_B16,
-  NI_TK_B32,
-  NI_TK_B64,
-  // Unsigned integers.
-  NI_TK_U8,
-  NI_TK_U16,
-  NI_TK_U32,
-  NI_TK_U64,
-  // NI_TK_U128,
-  NI_TK_USize,
-  // Signed integers.
-  NI_TK_S8,
-  NI_TK_S16,
-  NI_TK_S32,
-  NI_TK_S64,
-  // NI_TK_S128,
-  NI_TK_SSize,
-  // Floating point numbers.
-  NI_TK_F32,
-  NI_TK_F64,
-  // TODO: F80? Does anybody actually use it in current day and age?
-
+  _NI_TK_stringifiable_start,
   // TODO: automatically suggest adding NoReturn in tidy phase.
-  NI_TK_NoReturn,
+  NI_TK_NoReturn = _NI_TK_stringifiable_start,
 
   NI_TK_false,
   NI_TK_true,
   NI_TK_null,
+
+  NI_TK_intrinsic,
 
   NI_TK_type,
   NI_TK_subtype,
@@ -728,6 +717,8 @@ typedef enum {
   NI_TK_base10_literal,
   NI_TK_base16_literal,
   NI_TK_identifier,
+  NI_TK_before_beginning_of_file,
+  NI_TK_after_end_of_file,
   _NI_TK_count,
 } NiTokenKind;
 
@@ -735,32 +726,11 @@ typedef enum {
 // TODO: something like @don't this do identifier
 // TODO: align
 static const char* ni_token_cstr[_NI_TK_count] = {
-  [NI_TK_Bool8] = "Bool8",
-  [NI_TK_Byte] = "Byte",
-  [NI_TK_D8] = "D8",
-  [NI_TK_D16] = "D16",
-  [NI_TK_D32] = "D32",
-  [NI_TK_D64] = "D64",
-  [NI_TK_B8] = "B8",
-  [NI_TK_B16] = "B16",
-  [NI_TK_B32] = "B32",
-  [NI_TK_B64] = "B64",
-  [NI_TK_U8] = "U8",
-  [NI_TK_U16] = "U16",
-  [NI_TK_U32] = "U32",
-  [NI_TK_U64] = "U64",
-  [NI_TK_USize] = "USize",
-  [NI_TK_S8] = "S8",
-  [NI_TK_S16] = "S16",
-  [NI_TK_S32] = "S32",
-  [NI_TK_S64] = "S64",
-  [NI_TK_SSize] = "SSize",
-  [NI_TK_F32] = "F32",
-  [NI_TK_F64] = "F64",
   [NI_TK_NoReturn] = "NoReturn",
   [NI_TK_false] = "false",
   [NI_TK_true] = "true",
   [NI_TK_null] = "null",
+  [NI_TK_intrinsic] = "intrinsic",
   [NI_TK_type] = "type",
   [NI_TK_subtype] = "subtype",
   [NI_TK_alias] = "alias",
@@ -843,11 +813,6 @@ static const char* ni_token_cstr[_NI_TK_count] = {
 
 StringView ni_token_sv[_NI_TK_count];
 
-/*
-// Since each unique identifier is only stored once, we can use this integer as a unique hash for types.
-typedef IdentifierUID TypeUID;
-*/
-
 typedef struct {
   // TODO: struct of arrays
   size_t position_in_file;
@@ -861,6 +826,7 @@ typedef struct {
 
 MAKE_TYPED_ARENA_DEFINITION(NiToken, NiTokenArena, ni_token_arena_init, ni_token_arena_alloc, ni_token_arena_append);
 
+// TODO: add ascii to function name
 size_t from_start_length_of_sequence_of_alphanumeric_or_underscore(StringView const buffer) {
   // TODO: simd, shuffle && nibble trick
   size_t i = 0;
@@ -989,7 +955,6 @@ NiTokenKind classify_identifier(StringView const identifier_sv) {
       memcpy(&as_U16, identifier_sv.data, 2);
       switch (as_U16) {
         case 0x6669: return NI_TK_if;
-        case 0x3855: return NI_TK_U8;
         default:     return NI_TK_identifier;
       }
     }
@@ -997,7 +962,14 @@ NiTokenKind classify_identifier(StringView const identifier_sv) {
       uint32_t as_U32 = 0;
       memcpy(&as_U32, identifier_sv.data, 3);
       switch (as_U32) {
-        case 0x00343655: return NI_TK_U64;
+        default:         return NI_TK_identifier;
+      }
+    }
+    case 4: {
+      uint32_t as_U32 = 0;
+      memcpy(&as_U32, identifier_sv.data, 4);
+      switch (as_U32) {
+        case 0x65707974: return NI_TK_type;
         default:         return NI_TK_identifier;
       }
     }
@@ -1009,33 +981,152 @@ NiTokenKind classify_identifier(StringView const identifier_sv) {
         default:                 return NI_TK_identifier;
       }
     }
+    case 9: {
+      if (memcmp("intrinsic", identifier_sv.data, 9) == 0) {
+        return NI_TK_intrinsic;
+      }
+      return NI_TK_identifier;
+    }
     default: return NI_TK_identifier;
   }
 }
 
+
+/*
+Note (Nilpo):
+See note about IdentifierUID type to get what the hell is happening here.
+*/
+IdentifierUID compress_short_identifier_into_identifier_uid(StringView const identifier_sv) {
+  IdentifierUID res = identifier_sv.count << 48;
+  // TODO: metaprogramming and co.
+  // TODO: funnily enough, perfect hashing??
+  static const uint8_t lookup_table[256] = {
+    ['A'] = 1,
+    ['B'] = 2,
+    ['C'] = 3,
+    ['D'] = 4,
+    ['E'] = 5,
+    ['F'] = 6,
+    ['G'] = 7,
+    ['H'] = 8,
+    ['I'] = 9,
+    ['J'] = 10,
+    ['K'] = 11,
+    ['L'] = 12,
+    ['M'] = 13,
+    ['N'] = 14,
+    ['O'] = 15,
+    ['P'] = 16,
+    ['Q'] = 17,
+    ['R'] = 18,
+    ['S'] = 19,
+    ['T'] = 20,
+    ['U'] = 21,
+    ['V'] = 22,
+    ['W'] = 23,
+    ['X'] = 24,
+    ['Y'] = 25,
+    ['Z'] = 26,
+
+    ['a'] = 27,
+    ['b'] = 28,
+    ['c'] = 29,
+    ['d'] = 30,
+    ['e'] = 31,
+    ['f'] = 32,
+    ['g'] = 33,
+    ['h'] = 34,
+    ['i'] = 35,
+    ['j'] = 36,
+    ['k'] = 37,
+    ['l'] = 38,
+    ['m'] = 39,
+    ['n'] = 40,
+    ['o'] = 41,
+    ['p'] = 42,
+    ['q'] = 43,
+    ['r'] = 44,
+    ['s'] = 45,
+    ['t'] = 46,
+    ['u'] = 47,
+    ['v'] = 48,
+    ['w'] = 49,
+    ['x'] = 50,
+    ['y'] = 51,
+    ['z'] = 52,
+
+    ['0'] = 53,
+    ['1'] = 54,
+    ['2'] = 55,
+    ['3'] = 56,
+    ['4'] = 57,
+    ['5'] = 58,
+    ['6'] = 59,
+    ['7'] = 60,
+    ['8'] = 61,
+    ['9'] = 62,
+
+    ['_'] = 63,
+  };
+  uint8_t under_cursor = 0;
+  uint64_t compressed_value = 0;
+  // Note (Nilpo): I don't think you can reasonably SIMD that, unfortunately.
+  for (size_t i = 0; i < identifier_sv.count; i += 1) {
+    under_cursor = identifier_sv.data[i];
+    compressed_value = lookup_table[under_cursor];
+    res |= compressed_value << (6 * i);
+  }
+  return res;
+}
+
 typedef struct {
   NiTokenArena token_arena;
+  // TODO: make error arena last one.
   NiTokenizationErrorArena error_arena;
   USizeArena newline_indexes_arena;
+  USizeArena typedef_marks_arena;
   StringArena identifier_arena;
+  // TODO: bool unrecoverable_errors;
 } NiTokenizationResult;
+
+typedef struct {
+  NiTokenArena token_arena;
+  USizeArena newline_indexes_arena;
+  USizeArena typedef_marks_arena;
+} NiMinimalSuccessfulTokenizationResult;
 
 // TODO: store non-semantic tokens (newlines, comments) separately.
 NiTokenizationResult nic_tokenize(StringView const buffer) {
   // TODO: use var := ... in nilang;
   // TODO: init error arena
   // TODO: better heuristics for sizes of arenas
-  NiTokenArena token_arena = ni_token_arena_init(buffer.count * sizeof(NiToken), buffer.count);
+  /*
+  Note (Nilpo):
+  We append 8 "before_beginning_of_file" tokens at the beginning of arena and 8 "after_eof" tokens at the end.
+  This is so we can easily lookahead 8 tokens at any point during parsing.
+  */
+  size_t total_possible_tokens = buffer.count + 16;
+  // TODO: "res" variable
+  NiTokenArena token_arena = ni_token_arena_init(total_possible_tokens * sizeof(NiToken), total_possible_tokens);
   USizeArena newline_indexes_arena = usize_arena_init(buffer.count * sizeof(size_t), buffer.count);
+  USizeArena typedef_marks_arena = usize_arena_init(buffer.count * sizeof(size_t), buffer.count);
   StringArena identifier_arena = string_arena_init(buffer.count * sizeof(size_t), buffer.count);
   /* Note (Nilpo):
   This one is for internal needs.
   We first collect the indexes so we can avoid constantly rehashing the identifier hashtable.
   */
-  USizeArena identifier_indexes_arena = usize_arena_init(buffer.count * sizeof(size_t), buffer.count);
+  USizeArena long_identifier_indexes_arena = usize_arena_init(buffer.count * sizeof(size_t), buffer.count);
   size_t cursor = 0;
 
   NiToken next = {0};
+
+  next = (NiToken){.kind = NI_TK_before_beginning_of_file};
+  for (size_t i = 0; i < 8; i += 1) {
+    ni_token_arena_append(&token_arena, &next);
+  }
+
+  next = (NiToken){0};
+
   // TODO: while true
   for (;; ni_token_arena_append(&token_arena, &next)) {
     // TODO: skip whitespaces and newlines
@@ -1160,18 +1251,32 @@ NiTokenizationResult nic_tokenize(StringView const buffer) {
             next_character == '_') {
           // We add one to start, because identifiers can contain numbers, but should not begin with one.
           size_t length_after_first = from_start_length_of_sequence_of_alphanumeric_or_underscore(sv_slice(buffer, cursor + 1, buffer.count));
-	  size_t length = length_after_first + 1;
-	  // TODO: check if length is >= 2^^16 and report error if so.
-          next.kind = classify_identifier(sv_slice(buffer, cursor, cursor + length));
-	  if (next.kind == NI_TK_identifier) {
-            next.identifier_length = length;
-            usize_arena_append(&identifier_indexes_arena, &token_arena.count);
-	  }
+          size_t length = length_after_first + 1;
+          // TODO: check if length is >= 2^^16 and report error if so.
+          StringView identifier_sv = sv_slice(buffer, cursor, cursor + length);
+          next.kind = classify_identifier(identifier_sv);
+          switch (next.kind) {
+            case NI_TK_identifier: {
+              if (length <= 8) {
+                next.identifier_uid = compress_short_identifier_into_identifier_uid(identifier_sv);
+              } else {
+                next.identifier_length = length;
+                usize_arena_append(&long_identifier_indexes_arena, &token_arena.count);
+              }
+              break;
+            }
+            case NI_TK_type: {
+              usize_arena_append(&typedef_marks_arena, &token_arena.count);
+              break;
+            }
+            default:
+              break;
+          }
           cursor += length;
           continue;
         }
         if ('0' <= next_character && next_character <= '9') {
-	  // TODO: detect suffixes like "ULL" and co
+	      // TODO: detect suffixes like "ULL" and co
           auto _base10_res = from_start_length_of_sequence_of_numeric_base10(sv_slice(buffer, cursor, buffer.count));
           next.kind = NI_TK_base10_literal;
           // TODO: push error
@@ -1185,12 +1290,18 @@ NiTokenizationResult nic_tokenize(StringView const buffer) {
       }
     }
   }
-  
+
+  next = (NiToken){.kind = NI_TK_after_end_of_file, .position_in_file = cursor};
+  for (size_t i = 0; i < 8; i += 1) {
+    ni_token_arena_append(&token_arena, &next);
+  }
+
+  // TODO: we have to actually keep it cause modules?
   // Store each identifier in arena only once and update tokens of "identifier" kind with reference to that storage.
   {
-    IdentifierHashset identifier_uid_hashset = identifier_hashset_init_with_enough_memory_for_reasonably_low_collision_rate(identifier_indexes_arena.count);
-    for (size_t i = 0; i < identifier_indexes_arena.count; ++i) {
-      size_t index_in_token_arena = identifier_indexes_arena.data[i];
+    IdentifierHashset identifier_uid_hashset = identifier_hashset_init_with_enough_memory_for_reasonably_low_collision_rate(long_identifier_indexes_arena.count);
+    for (size_t i = 0; i < long_identifier_indexes_arena.count; ++i) {
+      size_t index_in_token_arena = long_identifier_indexes_arena.data[i];
       NiToken token = token_arena.data[index_in_token_arena];
       StringView key = sv_slice(buffer, token.position_in_file, token.position_in_file + (size_t)token.identifier_length);
       auto _get_res = identifier_hashset_check(&identifier_uid_hashset, &identifier_arena, key);
@@ -1208,13 +1319,13 @@ NiTokenizationResult nic_tokenize(StringView const buffer) {
     }
   }
 
-  return (NiTokenizationResult){token_arena, {0}, newline_indexes_arena, identifier_arena};
+  return (NiTokenizationResult){token_arena, {0}, newline_indexes_arena, typedef_marks_arena, identifier_arena};
 }
 
 static StringView ni_token_to_debug_sv(const StringArena* const identifier_arena,
                                        StringView const buffer,
                                        StringArena* const target,
-				       const NiToken* const token) {
+				                               const NiToken* const token) {
   StringView res = {0};
   // TODO: in nilang, we will have switches on ranges
   if (_NI_TK_stringifiable_start <= token->kind && token->kind < _NI_TK_stringifiable_end) {
@@ -1259,9 +1370,248 @@ typedef enum {
 
 /*
 Note (Nilpo):
-| 8 bits - kind | 56 bits - index in respective table |.
+| 8 bits - symbol kind | 56 bits - index in respective arena |.
 */
 typedef uint64_t NiSymbolUID;
+
+typedef U64ToU64Hashmap GlobalSymbolHashmap;
+
+typedef uint64_t NiTypeUID;
+
+typedef enum {
+  _NI_TYPE_PROP_zero_stub,
+  NI_TYPE_PROP_supports_comparison               = 1 << 1, // "==", "!="
+  NI_TYPE_PROP_supports_implicit_bool_conversion = 1 << 2, // Bool, Bitmask integers (B8-B64)
+  NI_TYPE_PROP_supports_ordered_comparison       = 1 << 3, // "<", "<=", ">", ">=", "<=>"
+  NI_TYPE_PROP_supports_bitwise                  = 1 << 4, // "<<", ">>", "&", "|", "^", ">|", "|<",
+  NI_TYPE_PROP_supports_arithmetic               = 1 << 5, // "+", "-" (binary), "/", "*"
+  NI_TYPE_PROP_supports_modulo                   = 1 << 6, // "%"
+  NI_TYPE_PROP_supports_signed_arithmetic        = 1 << 7, // "<<<", ">>>", "-" (unary), "%%" (TODO: placeholder name)
+  NI_TYPE_PROP_supports_saturated_arithmetic     = 1 << 8, // "++", "--", "**"
+  NI_TYPE_PROP_supports_sloppy_arithmetic        = 1 << 9, // "~+", "~-", "~*", "~/"
+  NI_TYPE_PROP_supports_ascii_string_literals    = 1 << 10, // Ascii integers (A8-A64)
+  NI_TYPE_PROP_supports_utf8_string_literals     = 1 << 11, // UTF-8 integers (C8-C64)
+  NI_TYPE_PROP_storage_8bits                     = 0b00 << 30,
+  NI_TYPE_PROP_storage_16bits                    = 0b01 << 30,
+  NI_TYPE_PROP_storage_32bits                    = 0b10 << 30,
+  NI_TYPE_PROP_storage_64bits                    = 0b11 << 30,
+  NI_TYPE_PROP_storage_bits_mask                 = 0b11 << 30,
+  // Property masks for different types and type classes.
+  NI_TYPE_PROP_Bool =
+    NI_TYPE_PROP_supports_comparison |
+    NI_TYPE_PROP_supports_implicit_bool_conversion |
+    NI_TYPE_PROP_storage_8bits,
+
+  NI_TYPE_PROP_Byte = NI_TYPE_PROP_supports_comparison | NI_TYPE_PROP_storage_8bits,
+
+  NI_TYPE_PROP_distinct_integer_mask =
+    NI_TYPE_PROP_supports_comparison,
+
+  NI_TYPE_PROP_D8  = NI_TYPE_PROP_distinct_integer_mask | NI_TYPE_PROP_storage_8bits,
+  NI_TYPE_PROP_D16 = NI_TYPE_PROP_distinct_integer_mask | NI_TYPE_PROP_storage_16bits,
+  NI_TYPE_PROP_D32 = NI_TYPE_PROP_distinct_integer_mask | NI_TYPE_PROP_storage_32bits,
+  NI_TYPE_PROP_D64 = NI_TYPE_PROP_distinct_integer_mask | NI_TYPE_PROP_storage_64bits,
+
+  NI_TYPE_PROP_bitmask_integer_mask =
+    NI_TYPE_PROP_supports_comparison |
+    NI_TYPE_PROP_supports_implicit_bool_conversion |
+    NI_TYPE_PROP_supports_bitwise,
+
+  NI_TYPE_PROP_B8  = NI_TYPE_PROP_bitmask_integer_mask | NI_TYPE_PROP_storage_8bits,
+  NI_TYPE_PROP_B16 = NI_TYPE_PROP_bitmask_integer_mask | NI_TYPE_PROP_storage_16bits,
+  NI_TYPE_PROP_B32 = NI_TYPE_PROP_bitmask_integer_mask | NI_TYPE_PROP_storage_32bits,
+  NI_TYPE_PROP_B64 = NI_TYPE_PROP_bitmask_integer_mask | NI_TYPE_PROP_storage_64bits,
+
+  NI_TYPE_PROP_unsigned_integer_mask =
+    NI_TYPE_PROP_supports_comparison |
+    NI_TYPE_PROP_supports_ordered_comparison |
+    NI_TYPE_PROP_supports_bitwise |
+    NI_TYPE_PROP_supports_arithmetic |
+    NI_TYPE_PROP_supports_modulo |
+    NI_TYPE_PROP_supports_saturated_arithmetic,
+
+  NI_TYPE_PROP_U8  = NI_TYPE_PROP_unsigned_integer_mask | NI_TYPE_PROP_storage_8bits,
+  NI_TYPE_PROP_U16 = NI_TYPE_PROP_unsigned_integer_mask | NI_TYPE_PROP_storage_16bits,
+  NI_TYPE_PROP_U32 = NI_TYPE_PROP_unsigned_integer_mask | NI_TYPE_PROP_storage_32bits,
+  NI_TYPE_PROP_U64 = NI_TYPE_PROP_unsigned_integer_mask | NI_TYPE_PROP_storage_64bits,
+
+  NI_TYPE_PROP_signed_integer_mask =
+    NI_TYPE_PROP_supports_comparison |
+    NI_TYPE_PROP_supports_ordered_comparison |
+    NI_TYPE_PROP_supports_bitwise |
+    NI_TYPE_PROP_supports_arithmetic |
+    NI_TYPE_PROP_supports_modulo |
+    NI_TYPE_PROP_supports_signed_arithmetic |
+    NI_TYPE_PROP_supports_saturated_arithmetic,
+
+  NI_TYPE_PROP_S8  = NI_TYPE_PROP_signed_integer_mask | NI_TYPE_PROP_storage_8bits,
+  NI_TYPE_PROP_S16 = NI_TYPE_PROP_signed_integer_mask | NI_TYPE_PROP_storage_16bits,
+  NI_TYPE_PROP_S32 = NI_TYPE_PROP_signed_integer_mask | NI_TYPE_PROP_storage_32bits,
+  NI_TYPE_PROP_S64 = NI_TYPE_PROP_signed_integer_mask | NI_TYPE_PROP_storage_64bits,
+
+  // TODO: floats
+} NiIntrinsicTypeProperties;
+
+typedef enum {
+  _NI_TYPE_zero_stub,
+  NI_TYPE_intrinsic,
+  NI_TYPE_type,    // aka "hard alias"/"distinct"
+  NI_TYPE_subtype, // aka "one-way alias"
+  // TODO: soft alias/typedef?
+  NI_TYPE_array,
+  NI_TYPE_slice,
+  _NI_TYPE_count,
+} NiTypeKind;
+
+typedef struct {
+  NiTypeKind kind;
+  /*
+  Note (Nilpo):
+  We can't remove identifier_uid from this struct, sadly.
+  You may ask, what if we make some kind of supplementary NiTypeUID -> NiIdentifierUID hashmap,
+  and then embed NiTypeKind into first bits of NiTypeUID?
+  Consider this situation:
+  Biba : type = U8;
+  Boba : type = U8;
+  Of course, Biba should not be implicitly convertable to Boba (and wise-versa),
+  but with proposed implementation they would share the same NiTypeUID.
+  Funnily enough, this would actually be fine for C typedefs, since they are "soft" aliases.
+  Hovewer, it should be noted that when we do hard alias of a hard alias:
+  Zhoka : type = U8;
+  Boka  : type = Zhoka;
+  We actually store the underlying type as U8 for both Zhoka and Boka.
+  In fact, "tidy" pass actually replaces all hard aliases like Boka:
+  Boka : type = Zhoka; => Boka : type = U8;
+  With structs, it replaces it with canonical struct definition:
+  TheGood : type = struct {...};
+  TheBad  : type = TheGood;
+  TheUgly : type = TheBad;       => TheUgly : type = TheGood.
+  This means that querying underlying type for hard aliases is always only one non-local memory lookup.
+  Of course, we can't guarantee the same with subtypes, but let's be real,
+  subtype of a subtype (of a subtype)* of a type is extremely rare anyways.
+  */
+  IdentifierUID identifier_uid;
+  union {
+    NiIntrinsicTypeProperties properties_mask; // for "intrinsic"
+    NiTypeUID underlying_type;                 // for "type" and "subtype"
+    NiTypeUID indexed_by_type;                 // for "array" and "slice"
+    size_t member_count;                       // for "struct", "union", and "enum"
+  };
+} NiTypeInfo;
+
+MAKE_TYPED_ARENA_DEFINITION(NiTypeInfo, NiTypeInfoArena, ni_typeinfo_arena_init, ni_typeinfo_arena_alloc, ni_typeinfo_arena_append);
+
+typedef enum {
+  _NI_AT_ERR_zero_stub,
+  NI_AT_ERR_expected_identifier_and_colon_before_typedef_mark,
+  NI_AT_ERR_expected_assign_after_typedef_mark,
+  NI_AT_ERR_expected_type_identifier_or_aggregate_type_mark,
+  NI_AT_ERR_no_such_intrinsic_type,
+  NI_AT_ERR_forgot_semicolon,
+  NI_AT_ERR_global_symbol_collision_type_type,
+  NI_AT_ERR_unclosed_rounded,
+  NI_AT_ERR_empty_expression,
+  NI_AT_ERR_incomplete_expression,
+  NI_AT_ERR_c_style_assign_usage,
+  NI_AT_ERR_c_style_comma_usage,
+  _NI_AT_ERR_count,
+} NiParsingErrorKind;
+
+typedef struct {
+  size_t position_in_file;
+  NiParsingErrorKind kind;
+  // This looks kinda cursed lol.
+  union {
+    IdentifierUID collided_identifier_uid;
+  };
+} NiParsingError;
+
+MAKE_TYPED_ARENA_DEFINITION(NiParsingError, NiParsingErrorArena, ni_parsing_error_arena_init, ni_parsing_error_arena_alloc, ni_parsing_error_arena_append);
+
+bool nic_parse_types(
+  const NiTokenArena* token_arena,
+  const USizeArena* typedef_marks_arena,
+  GlobalSymbolHashmap* global_symbol_hashmap,
+  NiTypeInfoArena* typeinfo_arena,
+  NiParsingErrorArena* error_arena
+) {
+  size_t index_in_token_arena = 0;
+  NiParsingError error = {0};
+  IdentifierUID identifier_uid = 0;
+  NiTypeInfo next = {0};
+
+  // Because 0 should not be valid NiTypeUID, because hashmaps.
+  typeinfo_arena->count += 1;
+
+  for (size_t cursor = 0; cursor < typedef_marks_arena->count; cursor += 1) {
+    index_in_token_arena = typedef_marks_arena->data[cursor];
+    // Note (Nilpo): Unchecked access is fine because we pad token_arena with non-existent tokens on both sides.
+    // TODO: cmov/csel/select
+    if (token_arena->data[index_in_token_arena - 1].kind != NI_TK_colon ||
+        token_arena->data[index_in_token_arena - 2].kind != NI_TK_identifier) {
+      error.kind = NI_AT_ERR_expected_identifier_and_colon_before_typedef_mark;
+    }
+    if (token_arena->data[index_in_token_arena + 1].kind != NI_TK_assign) {
+      error.kind = NI_AT_ERR_expected_assign_after_typedef_mark;
+    }
+    if (error.kind != _NI_AT_ERR_zero_stub) {
+      error.position_in_file = token_arena->data[index_in_token_arena].position_in_file;
+      ni_parsing_error_arena_append(error_arena, &error);
+      return false;
+    }
+    identifier_uid = token_arena->data[index_in_token_arena - 2].identifier_uid;
+    next = (NiTypeInfo){.identifier_uid = identifier_uid};
+
+    auto _hashmap_get_res = u64_to_u64_hashmap_get(global_symbol_hashmap, identifier_uid);
+    if (_hashmap_get_res.was_in_hashmap) {
+      error.position_in_file = token_arena->data[index_in_token_arena - 2].position_in_file;
+      error.kind = NI_AT_ERR_global_symbol_collision_type_type;
+      error.collided_identifier_uid = identifier_uid;
+      ni_parsing_error_arena_append(error_arena, &error);
+      return false;
+    }
+
+    // TODO: check collisions
+    switch (token_arena->data[index_in_token_arena + 2].kind) {
+      case NI_TK_intrinsic: {
+        // TODO: select
+        // TODO: compile-time execution
+        switch (identifier_uid) {
+          case 0x40000009A9A42: // Bool
+            next.properties_mask = NI_TYPE_PROP_Bool;
+            break;
+          case 0x2000000000F55: // U8
+            next.properties_mask = NI_TYPE_PROP_U8;
+            break;
+          case 0x3000000039ED5: // U64
+            next.properties_mask = NI_TYPE_PROP_U64;
+            break;
+          default:
+            next.properties_mask = _NI_TYPE_PROP_zero_stub;
+            break;
+        }
+        if (next.properties_mask == _NI_TYPE_PROP_zero_stub) {
+          error.position_in_file = token_arena->data[index_in_token_arena - 2].position_in_file;
+          error.kind = NI_AT_ERR_no_such_intrinsic_type;
+          ni_parsing_error_arena_append(error_arena, &error);
+          return false;
+        }
+        next.kind = NI_TYPE_intrinsic;
+        u64_to_u64_hashmap_insert_assume_no_such_key(global_symbol_hashmap, (U64ToU64HashmapEntry){identifier_uid, typeinfo_arena->count});
+        ni_typeinfo_arena_append(typeinfo_arena, &next);
+        continue;
+      }
+      default: {
+        error.position_in_file = token_arena->data[index_in_token_arena + 2].position_in_file;
+        error.kind = NI_AT_ERR_expected_type_identifier_or_aggregate_type_mark;
+        ni_parsing_error_arena_append(error_arena, &error);
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
 
 typedef enum {
   _NI_AT_zero_stub,
@@ -1279,11 +1629,12 @@ typedef enum {
   NI_AT_procedure_call,
   NI_AT_expression_end,
   NI_AT_declarator,
-  NI_AT_assign,
+  NI_AT_assignment,
   NI_AT_statement,
   NI_AT_statement_end,
   NI_AT_block, // aka "compound statement"/"scope"/multiple statements enclosed in {...}
   NI_AT_statement_if,
+  NI_AT_type_named,
   _NI_AT_count,
 } NiAtomKind;
 
@@ -1293,7 +1644,8 @@ TODO: yeah
 We have following precedence levels:
 - Default. This is when we start parsing from blank slate.
 - Logical or.
-- Logical and. It has higher precedence than or so the "a || b && c" parse as "a || (b && c)", which is intuitive.
+- Logical and. It has higher precedence than logical or,
+  so "a || b && c" will be parsed as "a || (b && c)", which is intuitive.
 */
 typedef enum {
   NI_PREC_default,
@@ -1351,6 +1703,7 @@ const char* ni_binop_cstr[_NI_BinOp_count] = {
 
 StringView ni_binop_sv[_NI_BinOp_count] = {0};
 
+// TODO: rename NiAtom => NiCode
 typedef struct {
   // TODO: struct of arrays
   size_t position_in_file;
@@ -1363,7 +1716,7 @@ typedef struct {
     NiUnaryOperatorKind   unary_op_kind;
     NiBinaryOperatorKind  binary_op_kind;
     NiTernaryOperatorKind ternary_op_kind;
-    IdentifierUID         identifier_uid;   // for casts, procedures, variables, and declarators
+    IdentifierUID         identifier_uid;   // for procedures, variables, declarators, and type_named.
     size_t                expression_count; // for assign.
     size_t                statement_count;  // for blocks, if/elif/else, cases.
     size_t                case_count;       // for switch (if var == {case; ...}), perfect_hash.
@@ -1376,27 +1729,17 @@ Note (Nilpo):
 Unlike most compilers, we do not have an AST (abstract syntax tree).
 The reason is, trees are non-linear in memory and bad for cache effects, and also hard to deal with.
 Instead, we have a linear "NiAtomArena", where everything is stored in reverse polish notation.
+TODO: better and accurate examples
 Examples:
-a := U64.69;           => |a|69|cast(U64)|:=|
-a = b + c + 1;         => |a|b |c        |+ |1   |+|=|
-d = func(1, a, 3) + 1; => |d|1 |a        |3 |func|1|+|=|
+a := U64.69;           => |a|69|cast(U64)|:=|stmt_end|
+a = b + c + 1;         => |a|b |c        |+ |1       |+|=|stmt_end|
+d = func(1, a, 3) + 1; => |d|1 |a        |3 |func    |1|+|=       |stmt_end
 Simple conditionals:
-if a && b || c { d; } else { e; f; } => |a|b|&&|c|"||"|if - 1 statement|d|else - 2 statements|e|f|
+if a && b || c { d; } else { e; f; } => |if - 1 statement|a|b|&&|c|"||"|d|else - 2 statements|e|f|
 if cond { a; } else if cond2 { b; c; } else { d; } => |cond|if - 1|a|cond2|elif - 2|b|c|else - 1|d|
 This might seem a little counter-intutitive, but it makes type-checking quite easy.
 */
 MAKE_TYPED_ARENA_DEFINITION(NiAtom, NiAtomArena, ni_atom_arena_init, ni_atom_arena_alloc, ni_atom_arena_append);
-
-typedef enum {
-  _NI_AT_ERR_zero_stub,
-  NI_AT_ERR_unclosed_rounded,
-  NI_AT_ERR_empty_expression,
-  NI_AT_ERR_incomplete_expression,
-  NI_AT_ERR_forgot_semicolon,
-  NI_AT_ERR_c_style_assign_usage,
-  NI_AT_ERR_c_style_comma_usage,
-  _NI_AT_ERR_count,
-} NiParsingErrorKind;
 
 // GOD THANK YOU DENIS RITCHIE AND BRIAN KERNIGAN FOR A WONDERFUL LANGUAGE WITHOUT MULTIPLE RETURN VALUES
 // AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
@@ -1407,10 +1750,11 @@ typedef struct {
   NiParsingErrorKind error_kind;
 } _ExprParseRes;
 
+// TODO: reorder parameters
 _ExprParseRes parse_expression_into_atom_arena(NiAtomArena* const atom_arena,
                                                const NiTokenArena* const token_arena,
                                                size_t cursor,
-					       NiOperatorPrecedence passed_precedence);
+					                                     NiOperatorPrecedence passed_precedence);
 
 _ExprParseRes parse_subexpression_into_atom_arena(NiAtomArena* const atom_arena,
                                                   const NiTokenArena* const token_arena,
@@ -1513,7 +1857,6 @@ The idea for this function is that it returns when encountering something which 
 It also stops when we encounter binary operator with precedence lower than passed.
 Thus, if we pass the lowest precedence available, we will parse the whole expression.
 Note (Nilpo):
-However, this does not apply to commas. They are handled in special manner.
 A little bit of a tough thing is multiple value assignment and commas.
 There is a lot of weird stuff people may write, and we somehow have to adequately report errors in all of them:
 Examples:
@@ -1528,6 +1871,7 @@ a = b = c;
 It gets especially hairy with commas:
 a = b, c = d; <- valid C!
 So, here's what we do:
+TODO: actually write this part.
 */
 _ExprParseRes parse_expression_into_atom_arena(NiAtomArena* const atom_arena,
                                                const NiTokenArena* const token_arena,
@@ -1575,7 +1919,14 @@ _ExprParseRes parse_expression_into_atom_arena(NiAtomArena* const atom_arena,
 
     // Here's the part where operator precedence and associativity are handled.
     // TODO: operator <=> in nilang
-    // Note (Nilpo): If we do strict greater here, the operator will be right associative.
+    /* Note (Nilpo):
+    If we do strict greater here, the operator will be right associative, meaning:
+    a + b + c => a + (b + c)
+    However, all operators in nilang are left-associative:
+    a + b + c => (a + b) + c
+    Some are not associative at all, e.g. comparison:
+    a == b == c => error, there is no situation where this would be reasonable thing to write without parenthesis.
+    */
     if (passed_precedence >= cursor_precedence) {
       return (_ExprParseRes){new_cursor, _NI_AT_ERR_zero_stub};
     }
@@ -1604,12 +1955,11 @@ _ExprParseRes parse_assign_or_expression_statement_into_atom_arena(
   size_t prev_cursor = cursor;
   size_t new_cursor = cursor;
   NiToken under_cursor = token_arena->data[new_cursor];
-  NiAtom next = (NiAtom){.position_in_file=under_cursor.position_in_file};
+  NiAtom next = (NiAtom){.position_in_file = under_cursor.position_in_file};
 
   size_t lhs_expressions_count = 0;
   // Parse left hand side of statement. This loop will only continue if we expect to actually get the expression.
   while (true) {
-    // TODO: add two eof tokens to token arena.
     // If declarator is under cursor, parse it.
     if (token_arena->data[new_cursor].kind == NI_TK_identifier &&
         token_arena->data[new_cursor + 1].kind == NI_TK_colon) {
@@ -1639,7 +1989,7 @@ _ExprParseRes parse_assign_or_expression_statement_into_atom_arena(
 
     under_cursor = token_arena->data[new_cursor];
     lhs_expressions_count += 1;
-    next = (NiAtom){.position_in_file=under_cursor.position_in_file, .kind=NI_AT_expression_end};
+    next = (NiAtom){.position_in_file = under_cursor.position_in_file, .kind = NI_AT_expression_end};
     ni_atom_arena_append(atom_arena, &next);
 
     if (under_cursor.kind != NI_TK_comma) {
@@ -1654,7 +2004,7 @@ _ExprParseRes parse_assign_or_expression_statement_into_atom_arena(
   switch (under_cursor.kind) {
     case NI_TK_assign:
       // TODO: do kind properly for all assigns.
-      next = (NiAtom){.position_in_file=under_cursor.position_in_file, .kind=NI_AT_assign};
+      next = (NiAtom){.position_in_file = under_cursor.position_in_file, .kind = NI_AT_assignment};
       ni_atom_arena_append(atom_arena, &next);
 
       // Skip assign operator.
@@ -1695,7 +2045,7 @@ _ExprParseRes parse_assign_or_expression_statement_into_atom_arena(
       // ni_atom_arena_append(atom_arena, &next);
       break;
   }
-  next.position_in_file=under_cursor.position_in_file;
+  next.position_in_file = under_cursor.position_in_file;
   next.kind = NI_AT_statement_end;
   ni_atom_arena_append(atom_arena, &next);
   return (_ExprParseRes){new_cursor, _NI_AT_ERR_zero_stub};
@@ -1717,18 +2067,43 @@ _ExprParseRes parse_statement_into_atom_arena(NiAtomArena* const atom_arena,
 }
 
 typedef struct {
-  NiAtomArena atom_arena;
-  // NiTokenizationErrorArena error_arena;
+  GlobalSymbolHashmap global_symbol_hashmap;
+  NiTypeInfoArena     typeinfo_arena;
+  NiAtomArena         atom_arena;
+  NiParsingErrorArena error_arena;
+  bool                unrecoverable_errors;
 } NiParsingResult;
 
-NiParsingResult nic_parse(const NiTokenArena* const token_arena) {
+NiParsingResult nic_parse(const NiMinimalSuccessfulTokenizationResult* tokenization_result) {
+  // TODO: "use" keyword in nilang
   // TODO: better heuristics for sizes of arenas
-  NiAtomArena atom_arena = ni_atom_arena_init(token_arena->count*sizeof(NiAtom), token_arena->count);
+  size_t token_count = tokenization_result->token_arena.count;
+  auto res = (NiParsingResult){
+    u64_to_u64_hashmap_init(token_count*sizeof(NiAtom), token_count),
+    ni_typeinfo_arena_init(token_count*sizeof(NiAtom), token_count),
+    ni_atom_arena_init(token_count*sizeof(NiAtom), token_count),
+    ni_parsing_error_arena_init(token_count*sizeof(NiAtom), token_count),
+    false,
+   };
+  // TODO: make real hashmap init please for the love of god
+  u64_to_u64_hashmap_alloc(&res.global_symbol_hashmap, token_count);
+
+  if (!nic_parse_types(
+    &tokenization_result->token_arena,
+    &tokenization_result->typedef_marks_arena,
+    &res.global_symbol_hashmap,
+    &res.typeinfo_arena,
+    &res.error_arena
+  )) {
+    res.unrecoverable_errors = true;
+    return res;
+  }
+  fprintf(stderr, "Parsed types!\n");
 
   size_t cursor = 0;
   _ExprParseRes _res = {0};
   while (true) {
-    _res = parse_statement_into_atom_arena(&atom_arena, token_arena, cursor);
+    _res = parse_statement_into_atom_arena(&res.atom_arena, &tokenization_result->token_arena, cursor);
     if (_res.error_kind != _NI_AT_ERR_zero_stub) {
       fprintf(stderr, "Error encountered: %d\n", _res.error_kind);
       break;
@@ -1736,13 +2111,13 @@ NiParsingResult nic_parse(const NiTokenArena* const token_arena) {
     cursor = _res.first_index_after_expression;
   }
 
-  return (NiParsingResult){atom_arena};
+  return res;
 }
 
 static StringView ni_atom_to_debug_sv(const StringArena* const identifier_arena,
                                       StringView const buffer,
                                       StringArena* const target,
-				      const NiAtom* const atom) {
+				                              const NiAtom* const atom) {
   StringView res = {0};
   // TODO: in nilang, we will have switches on ranges
   switch (atom->kind) {
@@ -1788,13 +2163,14 @@ static StringView ni_atom_to_debug_sv(const StringArena* const identifier_arena,
       res.count += string_arena_printf(target, "%.*s:_", (int)id.count, id.data);
       break;
     }
-    case NI_AT_assign: {
+    case NI_AT_assignment: {
       res.count += string_arena_append_sv(target, sv_from_cstr("="));
       break;
     }
-    default:
+    default: {
       res.count += string_arena_append_sv(target, sv_from_cstr("TODO"));
       break;
+    }
   }
   res.data = target->data + target->count - res.count;
   return res;
@@ -1891,7 +2267,7 @@ int main(void) {
   weird_sizeof_arena_test();
   odd_sizeof_arena_test();
   }
-  auto open_res = open_file("tests/expressions_and_precedence.ni", O_RDONLY);
+  auto open_res = open_file("tests/some_arithmetic_operators.ni", O_RDONLY);
   if (open_res.status != OpenOpStatus_success) {
     // TODO: string representations of all errors.
     fprintf(stdout, "Something went wrong while trying to open file.\n");
@@ -1920,17 +2296,26 @@ int main(void) {
   // printf("%.*s", (int)arena.count, arena.data);
   init_tokenizer_library();
   fprintf(stderr, "Initialized tokenizer library.\n");
-  NiTokenizationResult res = nic_tokenize(*(StringView*)&arena);
-  fprintf(stderr, "Tokenized. res.token_arena.count: %ld\n", res.token_arena.count);
+  NiTokenizationResult tokenization_result = nic_tokenize(*(StringView*)&arena);
+  fprintf(stderr, "Tokenized. tokenization_result.token_arena.count: %ld\n", tokenization_result.token_arena.count);
   StringArena debug_dump_arena = string_arena_init(16*1024*1024, 1024*1024);
+  /*
   for (size_t i = 0; i < res.token_arena.count; ++i) {
     StringView elem_debug_sv = ni_token_to_debug_sv(&res.identifier_arena, *(StringView*)&arena, &debug_dump_arena, &res.token_arena.data[i]);
     fprintf(stderr, "%.*s\n", (int)elem_debug_sv.count, elem_debug_sv.data);
   }
+  */
 
-  NiParsingResult parse_res = nic_parse(&res.token_arena);
-  for (size_t i = 0; i < parse_res.atom_arena.count; ++i) {
-    StringView elem_debug_sv = ni_atom_to_debug_sv(&res.identifier_arena, *(StringView*)&arena, &debug_dump_arena, &parse_res.atom_arena.data[i]);
+  auto successful_tokenization_result = (NiMinimalSuccessfulTokenizationResult){
+    tokenization_result.token_arena,
+    tokenization_result.newline_indexes_arena,
+    tokenization_result.typedef_marks_arena,
+  };
+
+  NiParsingResult parse_result = nic_parse(&successful_tokenization_result);
+  // TODO: check stuff
+  for (size_t i = 0; i < parse_result.atom_arena.count; ++i) {
+    StringView elem_debug_sv = ni_atom_to_debug_sv(&tokenization_result.identifier_arena, *(StringView*)&arena, &debug_dump_arena, &parse_result.atom_arena.data[i]);
     fprintf(stderr, "%.*s ", (int)elem_debug_sv.count, elem_debug_sv.data);
   }
   fprintf(stderr, "\n");

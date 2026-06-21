@@ -3,5 +3,6 @@
 /preprocessor
 /*.out
 /string_to_int
+/compress_identifier
 .*.swp
 
